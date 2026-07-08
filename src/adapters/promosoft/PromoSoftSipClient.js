@@ -2070,7 +2070,7 @@ class PromoSoftSipClient {
       if (call.requiresTimer) requireTimerLine = "Require: timer";
     }
 
-    const lines = [
+    const headerLines = [
       "SIP/2.0 200 OK",
       viaHeader  ? `Via: ${viaHeader}`   : null,
       fromHeader ? `From: ${fromHeader}` : null,
@@ -2088,9 +2088,10 @@ class PromoSoftSipClient {
       `User-Agent: LabelGateway/1.0`,
       `Content-Type: application/sdp`,
       `Content-Length: ${bodyLen}`,
-      "",
-      localSdp,
     ].filter(Boolean);
+    // Build headers and body separately so the mandatory blank-line separator
+    // (RFC 3261 §7) can never be dropped by .filter(Boolean) stripping the "".
+    const lines = [headerLines.join("\r\n"), "", localSdp];
 
     const msg = lines.join("\r\n");
 
