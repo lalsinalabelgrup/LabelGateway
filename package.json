@@ -6,12 +6,15 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
-    "debug": "node --inspect src/server.js"
+    "debug": "node --inspect src/server.js",
+    "probe:promosoft-register": "node tools/promosoftRegisterProbe.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.21.2",
+    "jssip": "^3.13.8",
+    "jssip-node-websocket": "^3.0.0",
     "pino": "^9.6.0",
     "pino-pretty": "^13.0.0",
     "ws": "^8.18.1",

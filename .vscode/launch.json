@@ -2,25 +2,7 @@
   "version": "0.2.0",
   "configurations": [
     {
-      // Open LabelGateway/ as the workspace root for this profile to work.
-      // If you opened LabelSuite/, use the launch.json at LabelSuite/.vscode/ instead.
-      "name": "Debug LabelGateway",
-      "type": "node",
-      "request": "launch",
-      "program": "${workspaceFolder}/src/server.js",
-      "cwd": "${workspaceFolder}",
-      "envFile": "${workspaceFolder}/.env",
-      "env": {
-        "NODE_ENV": "development"
-      },
-      "console": "integratedTerminal",
-      "skipFiles": ["<node_internals>/**"],
-      "smartStep": true
-    },
-    {
-      // Forces PromoSoft provider regardless of what .env says.
-      // Secrets (PROMOSOFT_SIP_SERVER, passwords) must be in .env — never here.
-      "name": "Debug LabelGateway with PromoSoft",
+      "name": "Debug LabelGateway PromoSoft Minimal",
       "type": "node",
       "request": "launch",
       "program": "${workspaceFolder}/src/server.js",
@@ -28,39 +10,9 @@
       "envFile": "${workspaceFolder}/.env",
       "env": {
         "NODE_ENV": "development",
-        "TELEPHONY_PROVIDER": "promosoft",
-        "ADAPTER": "promosoft"
+        "TELEPHONY_PROVIDER": "promosoft"
       },
       "console": "integratedTerminal",
-      "skipFiles": ["<node_internals>/**"],
-      "smartStep": true
-    },
-    {
-      // Forces MockAdapter — no credentials required, safe for offline work.
-      "name": "Debug LabelGateway with Mock",
-      "type": "node",
-      "request": "launch",
-      "program": "${workspaceFolder}/src/server.js",
-      "cwd": "${workspaceFolder}",
-      "envFile": "${workspaceFolder}/.env",
-      "env": {
-        "NODE_ENV": "development",
-        "TELEPHONY_PROVIDER": "mock",
-        "ADAPTER": "mock"
-      },
-      "console": "integratedTerminal",
-      "skipFiles": ["<node_internals>/**"],
-      "smartStep": true
-    },
-    {
-      // Attach to a process already running with --inspect.
-      // Start it with: npm run debug   (node --inspect src/server.js)
-      "name": "Attach to LabelGateway (port 9229)",
-      "type": "node",
-      "request": "attach",
-      "port": 9229,
-      "restart": true,
-      "cwd": "${workspaceFolder}",
       "skipFiles": ["<node_internals>/**"],
       "smartStep": true
     }

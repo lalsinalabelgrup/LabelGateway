@@ -26,6 +26,24 @@ const MockAdapter         = require('../adapters/MockAdapter');
 const config              = require('../config/config');
 const logger              = require('../utils/logger');
 
+/* ─── Registration state (server-level, updated by event interception) ──────
+   Tracks the most recent registration event so /api/status can report it.
+   Password is never stored here. */
+let _registrationState = {
+  provider:           config.TELEPHONY_PROVIDER,
+  registered:         false,
+  extension:          null,
+  registrar:          null,
+  transport:          null,
+  lastRegistrationAt: null,
+  expiresIn:          null,
+  expiresAt:          null,
+};
+
+function getRegistrationState() {
+  return { ..._registrationState };
+}
+
 /* ─── Adapter factory ────────────────────────────────────────────────────── */
 
 function createAdapter(sendEvent) {
@@ -105,6 +123,38 @@ function setupWsServer(httpServer) {
        Events include callId at the top level (not nested in payload)
        so clients can correlate events to calls without payload inspection. */
     const sendEvent = (event, payload, callId) => {
+      // Intercept registration events to keep the server-level state current.
+      if (event === 'registered') {
+        _registrationState = {
+          provider:           payload.provider   || config.TELEPHONY_PROVIDER,
+          registered:         true,
+          extension:          payload.extension  || null,
+          registrar:          payload.registrar  || null,
+          transport:          payload.transport  || null,
+          lastRegistrationAt: payload.registeredAt || new Date().toISOString(),
+          expiresIn:          payload.expiresIn  || null,
+          expiresAt:          payload.expiresAt  || null,
+        };
+      } else if (event === 'unregistered') {
+        _registrationState = {
+          provider:           config.TELEPHONY_PROVIDER,
+          registered:         false,
+          extension:          null,
+          registrar:          null,
+          transport:          null,
+          lastRegistrationAt: null,
+          expiresIn:          null,
+          expiresAt:          null,
+        };
+      } else if (event === 'registrationFailed') {
+        _registrationState = {
+          ..._registrationState,
+          registered:        false,
+          lastFailureReason: payload.reason     || null,
+          lastFailureAt:     new Date().toISOString(),
+        };
+      }
+
       if (ws.readyState !== ws.OPEN) return;
       try {
         const msg = { event, timestamp: new Date().toISOString(), payload: payload || {} };
@@ -184,3 +234,4 @@ function setupWsServer(httpServer) {
 }
 
 module.exports = setupWsServer;
+module.exports.getRegistrationState = getRegistrationState;

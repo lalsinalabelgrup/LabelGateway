@@ -21,11 +21,12 @@ class AdapterNotReadyError extends Error {
 }
 
 class PromoSoftSipError extends Error {
-  constructor(message, cause) {
+  constructor(message, cause, statusCode) {
     super(message);
-    this.name  = 'PromoSoftSipError';
-    this.code  = 'PROMOSOFT_SIP_ERROR';
-    this.cause = cause || null;
+    this.name       = 'PromoSoftSipError';
+    this.code       = 'PROMOSOFT_SIP_ERROR';
+    this.cause      = cause      || null;
+    this.statusCode = statusCode || null;
   }
 }
 

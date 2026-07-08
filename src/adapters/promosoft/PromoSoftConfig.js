@@ -10,20 +10,48 @@ const { AdapterNotReadyError } = require('./PromoSoftErrors');
 
 class PromoSoftConfig {
   constructor(env = process.env) {
+    // ── Transport mode ──────────────────────────────────────────────────────
+    // 'udp'  → PromoSoftSipClient (manual SIP over dgram, legacy)
+    // 'wss'  → PromoSoftWssClient (JsSIP over WebSocket)
+    this.mode = (env.PROMOSOFT_MODE || 'udp').toLowerCase();
+
+    // ── UDP mode config ─────────────────────────────────────────────────────
     this.sipServer    = env.PROMOSOFT_SIP_SERVER    || null;
     this.sipPort      = parseInt(env.PROMOSOFT_SIP_PORT, 10) || 5060;
     this.sipTransport = env.PROMOSOFT_SIP_TRANSPORT || 'udp';
     this.sipDomain    = env.PROMOSOFT_SIP_DOMAIN    || null;
-    // STUN is used to discover the external IP/port when behind NAT.
-    // PromoSoftSipClient uses rport for basic NAT traversal; STUN gives the
-    // exact external address for Via/Contact when the PBX is on the public internet.
     this.sipStunServer = env.PROMOSOFT_STUN_SERVER  || null;
     this.debug        = env.PROMOSOFT_DEBUG === 'true';
+    // Write every raw SIP message (INVITE / 200 OK / ACK / BYE) to logs/sip/.
+    // Set PROMOSOFT_SIP_DUMP=true to enable.  Independent of debug logging.
+    this.sipDump      = env.PROMOSOFT_SIP_DUMP === 'true';
+
+    // Local SIP UDP port to bind to (0 = OS picks an ephemeral port).
+    // Set PROMOSOFT_SIP_BIND_PORT=5060 or 5062 for a stable port so the
+    // Contact header uses a predictable value rather than an ephemeral one.
+    this.sipBindPort  = parseInt(env.PROMOSOFT_SIP_BIND_PORT, 10) || 0;
+
+    // RTP media NAT (UDP mode only)
+    this.publicRtpIp  = env.PROMOSOFT_PUBLIC_RTP_IP  || null;
+    this.rtpPortMin   = parseInt(env.PROMOSOFT_RTP_PORT_MIN, 10) || 20000;
+    this.rtpPortMax   = parseInt(env.PROMOSOFT_RTP_PORT_MAX, 10) || 20100;
+
+    // ── WSS mode config ─────────────────────────────────────────────────────
+    // PROMOSOFT_WS_URL      — WebSocket endpoint (e.g. wss://prelabel2.guccontactcenter.com:8089)
+    // PROMOSOFT_AUTH_USER   — SIP authorization user; defaults to the extension from login
+    // PROMOSOFT_CONTACT_URI — Stable SIP Contact URI sent in REGISTER/INVITE.
+    //   If unset, JsSIP generates a random sip:<token>@<token>.invalid;transport=ws which
+    //   some PBX dashboards fail to resolve back to the registered extension.
+    //   Set to: sip:<extension>@<host>;transport=ws
+    this.wsUrl      = env.PROMOSOFT_WS_URL      || null;
+    this.authUser   = env.PROMOSOFT_AUTH_USER   || null;
+    this.contactUri = env.PROMOSOFT_CONTACT_URI || null;
 
     if (!this.isServerConfigured()) {
       const logger = require('../../utils/logger');
+      const missingVar = this.mode === 'wss' ? 'PROMOSOFT_WS_URL' : 'PROMOSOFT_SIP_SERVER';
       logger.warn(
-        'PromoSoftConfig: PROMOSOFT_SIP_SERVER is not set — ' +
+        `PromoSoftConfig: ${missingVar} is not set — ` +
         'registrationFailed will be emitted when a client connects'
       );
     }
@@ -31,6 +59,7 @@ class PromoSoftConfig {
 
   /** Returns true when the minimum SIP infrastructure is configured. */
   isServerConfigured() {
+    if (this.mode === 'wss') return !!this.wsUrl;
     return !!this.sipServer;
   }
 
@@ -50,9 +79,15 @@ class PromoSoftConfig {
     return `${scheme}:${this.sipServer}:${this.sipPort};transport=${this.sipTransport}`;
   }
 
-  /** Effective SIP domain (falls back to server hostname if not set). */
+  /** Effective SIP domain for URI construction. */
   get serverDomain() {
-    return this.sipDomain || this.sipServer;
+    if (this.sipDomain) return this.sipDomain;
+    if (this.sipServer) return this.sipServer;
+    // WSS mode: derive hostname from the WebSocket URL
+    if (this.wsUrl) {
+      try { return new URL(this.wsUrl).hostname; } catch (_) {}
+    }
+    return null;
   }
 }
 
