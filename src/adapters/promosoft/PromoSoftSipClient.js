@@ -580,6 +580,28 @@ class PromoSoftSipClient {
               contactUri,
               routeHeaders,
             });
+            if (inv.cancelRequested) {
+              // RFC 3261 §9.1 glare: the 2xx arrived after we already sent
+              // CANCEL. The dialog is now established server-side — ACK it
+              // (above), then immediately BYE to tear it down instead of
+              // surfacing it as an answered call.
+              logger.info(
+                { sipCallId, from: inv.fromExtension, to: inv.targetNumber },
+                "PromoSoftSipClient: ← INVITE 2xx after CANCEL (glare) — sending BYE to tear down",
+              );
+              this.bye({
+                fromExtension: inv.fromExtension,
+                targetNumber: inv.targetNumber,
+                sipCallId,
+                fromTag: inv.fromTag,
+                toTag,
+                cseq: inv.cseq + 1,
+              }).catch((err) =>
+                logger.warn({ sipCallId, err: err.message }, "PromoSoftSipClient: glare BYE error (ignored)"),
+              );
+              inv.reject(new PromoSoftSipError("SIP INVITE cancelled", null, 487));
+              return;
+            }
             // Track the established dialog so an incoming remote BYE can be matched
             this._calls.set(sipCallId, {
               fromExtension: inv.fromExtension,
@@ -589,7 +611,7 @@ class PromoSoftSipClient {
               domain: inv.domain,
               onRemoteBye: inv.onRemoteBye,
             });
-            inv.resolve({ status, sipCallId, fromTag: inv.fromTag, toTag });
+            inv.resolve({ status, sipCallId, fromTag: inv.fromTag, toTag, cseq: inv.cseq });
           } else if ((status === 401 || status === 407) && !inv.authAttempted) {
             // Authentication challenge — retry INVITE with digest (same flow as REGISTER)
             inv.authAttempted = true;
@@ -640,6 +662,18 @@ class PromoSoftSipClient {
                 "PromoSoftSipClient: INVITE auth challenge params",
               );
             }
+            if (inv.cancelRequested) {
+              // Hangup was clicked while we were mid-challenge — don't start a
+              // fresh transaction we'd immediately have to cancel again.
+              clearTimeout(inv.timer);
+              this._invites.delete(sipCallId);
+              logger.info(
+                { sipCallId },
+                "PromoSoftSipClient: INVITE auth retry skipped — CANCEL already requested",
+              );
+              inv.reject(new PromoSoftSipError("SIP INVITE cancelled", null, 487));
+              return;
+            }
             const authz = this._computeDigestAuth({
               extension,
               password,
@@ -650,6 +684,7 @@ class PromoSoftSipClient {
               method: "INVITE",
             });
             inv.cseq += 1;
+            inv.branch = this._newBranch();
             const retryMsg = this._buildInvite({
               fromExtension: inv.fromExtension,
               targetNumber: inv.targetNumber,
@@ -659,6 +694,7 @@ class PromoSoftSipClient {
               sdp: inv.sdp,
               cseq: inv.cseq,
               authorization: authz,
+              branch: inv.branch,
             });
             logger.info(
               {
@@ -667,6 +703,7 @@ class PromoSoftSipClient {
                 to: inv.targetNumber,
                 realm: challenge.realm,
                 cseq: inv.cseq,
+                branch: inv.branch,
               },
               "PromoSoftSipClient: → INVITE (authenticated retry)",
             );
@@ -697,7 +734,8 @@ class PromoSoftSipClient {
               },
             );
           } else {
-            // 3xx–6xx: final failure (or second 401 — auth gave up)
+            // 3xx–6xx: final failure (or second 401 — auth gave up).
+            // Includes 487 Request Terminated, the PBX's response to our CANCEL.
             clearTimeout(inv.timer);
             this._invites.delete(sipCallId);
             logger.warn(
@@ -707,8 +745,29 @@ class PromoSoftSipClient {
                 sipCallId,
                 from: inv.fromExtension,
                 to: inv.targetNumber,
+                cancelRequested: inv.cancelRequested,
               },
               "PromoSoftSipClient: ← INVITE failed",
+            );
+            // RFC 3261 §17.1.1.3: ACK to a non-2xx final response is part of
+            // the SAME transaction as the INVITE — reuse its branch and CSeq
+            // (not a new transaction like the 2xx-ACK case above).
+            const toTag = (h["to"] || "").match(/tag=([^\s;]+)/i)?.[1] || null;
+            this._sendAck({
+              fromExtension: inv.fromExtension,
+              targetNumber: inv.targetNumber,
+              domain: inv.domain,
+              sipCallId,
+              fromTag: inv.fromTag,
+              toTag,
+              cseq: inv.cseq,
+              branch: inv.branch,
+              host: this._config.sipServer,
+              port: this._config.sipPort,
+            });
+            logger.info(
+              { sipCallId, status, cseq: inv.cseq, branch: inv.branch },
+              "PromoSoftSipClient: → ACK sent for non-2xx final response",
             );
             inv.reject(
               new PromoSoftSipError(
@@ -1394,7 +1453,7 @@ class PromoSoftSipClient {
    *   onRemoteBye({ sipCallId, fromTag, toTag }) — called when the remote endpoint sends BYE.
    * @returns {Promise<{ status, sipCallId, fromTag, toTag }>}
    */
-  async invite({ fromExtension, targetNumber, onProvisional, onRemoteBye }) {
+  async invite({ fromExtension, targetNumber, onProvisional, onRemoteBye, onInviteCreated }) {
     if (!this._registered || !this._socket) {
       throw new PromoSoftSipError(
         "SIP client not registered — send login command first",
@@ -1406,20 +1465,23 @@ class PromoSoftSipClient {
     const port = this._config.sipPort;
     const sipCallId = this._newCallId();
     const fromTag = this._newTag();
+    const branch = this._newBranch();
     const sdp = this._buildSdp();
 
     // Equivalent of JsSIP "newRTCSession" — log sipCallId so every subsequent
-    // event can be correlated back to this call.
+    // event can be correlated back to this call. Includes branch/CSeq/domain
+    // so this can be compared side-by-side against the CANCEL that may follow.
     logger.info(
-      { fromExtension, targetNumber, sipCallId, host, port },
+      { fromExtension, targetNumber, domain, sipCallId, fromTag, cseq: 1, branch, host, port },
       "PromoSoftSipClient: → INVITE (newRTCSession)",
     );
-    if (this._config.debug) {
-      logger.debug(
-        { fromExtension, targetNumber, sipCallId },
-        `PromoSoftSipClient: SDP offer:\n${sdp}`,
-      );
-    }
+
+    // Let the caller learn the sipCallId as soon as it exists, so hangup()
+    // during ringing (before this promise settles) can still target this
+    // transaction with a CANCEL.
+    try {
+      (onInviteCreated || (() => {}))({ sipCallId });
+    } catch (_) {}
 
     const msg = this._buildInvite({
       fromExtension,
@@ -1429,8 +1491,13 @@ class PromoSoftSipClient {
       fromTag,
       sdp,
       cseq: 1,
+      branch,
     });
     if (this._config.debug) {
+      logger.debug(
+        { fromExtension, targetNumber, sipCallId },
+        `PromoSoftSipClient: SDP offer:\n${sdp}`,
+      );
       logger.debug(
         { direction: "OUT", sipCallId },
         `PromoSoftSipClient: INVITE packet:\n${msg}`,
@@ -1451,8 +1518,10 @@ class PromoSoftSipClient {
         );
       }, TRANSACTION_TIMEOUT);
 
-      // sdp, cseq, and onRemoteBye are stored for the 401 retry handler and
-      // post-answer BYE dispatch.
+      // sdp, cseq, branch, and onRemoteBye are stored for the 401 retry handler,
+      // CANCEL (while ringing), and post-answer BYE dispatch. `branch` is
+      // updated on each authenticated retry to track whichever INVITE
+      // transaction is currently outstanding.
       this._invites.set(sipCallId, {
         fromExtension,
         targetNumber,
@@ -1460,7 +1529,9 @@ class PromoSoftSipClient {
         domain,
         sdp,
         cseq: 1,
+        branch,
         authAttempted: false,
+        cancelRequested: false,
         onProvisional: onProvisional || (() => {}),
         onRemoteBye: onRemoteBye || (() => {}),
         resolve,
@@ -1502,10 +1573,84 @@ class PromoSoftSipClient {
       cseq,
     });
     logger.info(
-      { fromExtension, targetNumber, sipCallId },
-      "PromoSoftSipClient: BYE (ended)",
+      { fromExtension, targetNumber, sipCallId, cseq },
+      "PromoSoftSipClient: → BYE built and sending",
     );
-    return this._sendAndWait(msg, host, port, `${sipCallId}:2`);
+    return this._sendAndWait(msg, host, port, `${sipCallId}:${cseq}`)
+      .then((res) => {
+        logger.info(
+          { sipCallId, cseq, status: res?.status, reason: res?.reason },
+          "PromoSoftSipClient: ← BYE response received",
+        );
+        return res;
+      })
+      .catch((err) => {
+        logger.warn(
+          { sipCallId, cseq, err: err.message },
+          "PromoSoftSipClient: BYE — no response / transaction failed",
+        );
+        throw err;
+      });
+  }
+
+  /**
+   * Send SIP CANCEL for an INVITE transaction that is still pending (not yet
+   * answered with a final 2xx). Only valid while the call is ringing/early.
+   */
+  async cancel({ sipCallId }) {
+    if (!this._socket) return;
+    const inv = this._invites.get(sipCallId);
+    if (!inv) {
+      logger.warn({ sipCallId }, "PromoSoftSipClient: cancel — no pending INVITE transaction found");
+      return;
+    }
+    inv.cancelRequested = true;
+
+    const host = this._config.sipServer;
+    const port = this._config.sipPort;
+    const msg = this._buildCancel({
+      fromExtension: inv.fromExtension,
+      targetNumber: inv.targetNumber,
+      domain: inv.domain,
+      sipCallId,
+      fromTag: inv.fromTag,
+      cseq: inv.cseq,
+      branch: inv.branch,
+    });
+    logger.info(
+      {
+        fromExtension: inv.fromExtension,
+        targetNumber: inv.targetNumber,
+        domain: inv.domain,
+        sipCallId,
+        fromTag: inv.fromTag,
+        cseq: inv.cseq,
+        branch: inv.branch,
+        host,
+        port,
+      },
+      "PromoSoftSipClient: → CANCEL built and sending",
+    );
+    if (this._config.debug) {
+      logger.debug(
+        { direction: "OUT", sipCallId },
+        `PromoSoftSipClient: CANCEL packet:\n${msg}`,
+      );
+    }
+    return this._sendAndWait(msg, host, port, `${sipCallId}:${inv.cseq}`)
+      .then((res) => {
+        logger.info(
+          { sipCallId, cseq: inv.cseq, status: res?.status, reason: res?.reason },
+          "PromoSoftSipClient: ← CANCEL response received",
+        );
+        return res;
+      })
+      .catch((err) => {
+        logger.warn(
+          { sipCallId, cseq: inv.cseq, err: err.message },
+          "PromoSoftSipClient: CANCEL — no response / transaction failed (ignored)",
+        );
+      });
   }
 
   /* ── SIP INVITE message builders ─────────────────────────────────────── */
@@ -1519,11 +1664,12 @@ class PromoSoftSipClient {
     sdp,
     cseq = 1,
     authorization = null,
+    branch = null,
   }) {
     const bodyLen = Buffer.byteLength(sdp, "utf8");
     const lines = [
       `INVITE sip:${targetNumber}@${domain} SIP/2.0`,
-      `Via: SIP/2.0/UDP ${this._localIp}:${this._localPort};branch=${this._newBranch()};rport`,
+      `Via: SIP/2.0/UDP ${this._localIp}:${this._localPort};branch=${branch || this._newBranch()};rport`,
       `From: <sip:${fromExtension}@${domain}>;tag=${fromTag}`,
       `To: <sip:${targetNumber}@${domain}>`,
       `Call-ID: ${sipCallId}`,
@@ -1549,6 +1695,7 @@ class PromoSoftSipClient {
     cseq = 1,
     requestUri = null,
     routeHeaders = [],
+    branch = null,
   }) {
     const uri = requestUri || `sip:${targetNumber}@${domain}`;
     const toLine = toTag
@@ -1556,7 +1703,7 @@ class PromoSoftSipClient {
       : `To: <sip:${targetNumber}@${domain}>`;
     const lines = [
       `ACK ${uri} SIP/2.0`,
-      `Via: SIP/2.0/UDP ${this._localIp}:${this._localPort};branch=${this._newBranch()};rport`,
+      `Via: SIP/2.0/UDP ${this._localIp}:${this._localPort};branch=${branch || this._newBranch()};rport`,
       `From: <sip:${fromExtension}@${domain}>;tag=${fromTag}`,
       toLine,
       `Call-ID: ${sipCallId}`,
@@ -1592,6 +1739,34 @@ class PromoSoftSipClient {
       toLine,
       `Call-ID: ${sipCallId}`,
       `CSeq: ${cseq} BYE`,
+      `Max-Forwards: 70`,
+      `Content-Length: 0`,
+      "",
+      "",
+    ].join("\r\n");
+  }
+
+  /**
+   * Build a CANCEL for a pending INVITE transaction (RFC 3261 §9.1).
+   * MUST reuse the exact same Call-ID, From tag, To (no tag yet), numeric
+   * CSeq, and Via branch as the INVITE it targets.
+   */
+  _buildCancel({
+    fromExtension,
+    targetNumber,
+    domain,
+    sipCallId,
+    fromTag,
+    cseq,
+    branch,
+  }) {
+    return [
+      `CANCEL sip:${targetNumber}@${domain} SIP/2.0`,
+      `Via: SIP/2.0/UDP ${this._localIp}:${this._localPort};branch=${branch};rport`,
+      `From: <sip:${fromExtension}@${domain}>;tag=${fromTag}`,
+      `To: <sip:${targetNumber}@${domain}>`,
+      `Call-ID: ${sipCallId}`,
+      `CSeq: ${cseq} CANCEL`,
       `Max-Forwards: 70`,
       `Content-Length: 0`,
       "",
@@ -1899,16 +2074,19 @@ class PromoSoftSipClient {
     cseq = 1,
     contactUri = null,
     routeHeaders = [],
+    branch = null,
+    host = null,
+    port = null,
   }) {
     const requestUri = contactUri || `sip:${targetNumber}@${domain}`;
 
     // Determine physical send address: Route set → Contact URI → SIP server fallback
-    let ackHost = this._config.sipServer;
-    let ackPort = this._config.sipPort;
-    if (routeHeaders.length > 0) {
+    let ackHost = host || this._config.sipServer;
+    let ackPort = port || this._config.sipPort;
+    if (!host && routeHeaders.length > 0) {
       const m = routeHeaders[0].match(/sip:(?:[^@]+@)?([^;>\s:]+)(?::(\d+))?/i);
       if (m) { ackHost = m[1]; ackPort = m[2] ? parseInt(m[2], 10) : this._config.sipPort; }
-    } else if (contactUri) {
+    } else if (!host && contactUri) {
       const m = contactUri.match(/sip:(?:[^@]+@)?([^;>\s:]+)(?::(\d+))?/i);
       if (m) { ackHost = m[1]; ackPort = m[2] ? parseInt(m[2], 10) : this._config.sipPort; }
     }
@@ -1923,6 +2101,7 @@ class PromoSoftSipClient {
       cseq,
       requestUri,
       routeHeaders,
+      branch,
     });
 
     logger.info(

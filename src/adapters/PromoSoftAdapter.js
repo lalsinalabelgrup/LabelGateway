@@ -311,6 +311,7 @@ class PromoSoftAdapter extends BaseTelephonyAdapter {
       toTag: null,
       number,
       status: "calling",
+      direction: "outbound",
     };
 
     // Emit outgoingCall immediately — do NOT gate on receiving 100 Trying
@@ -342,6 +343,18 @@ class PromoSoftAdapter extends BaseTelephonyAdapter {
           "PromoSoftAdapter: ← INVITE provisional",
         );
       }
+    };
+
+    // Called synchronously by the SIP client as soon as the INVITE transaction
+    // exists (before any response) — makes sipCallId available to hangup()
+    // while the call is still ringing, so it can send CANCEL.
+    const onInviteCreated = ({ sipCallId: sid }) => {
+      if (!this._call || this._call.callId !== callId) return;
+      this._call.sipCallId = sid;
+      logger.info(
+        { extension, number, callId, sipCallId: sid },
+        "PromoSoftAdapter: outbound INVITE transaction created",
+      );
     };
 
     // Called by the SIP client when the remote endpoint sends BYE (remote hangup).
@@ -379,16 +392,22 @@ class PromoSoftAdapter extends BaseTelephonyAdapter {
         targetNumber: number,
         onProvisional,
         onRemoteBye,
+        onInviteCreated,
       })
-      .then(({ sipCallId: sid, fromTag, toTag, status }) => {
+      .then(({ sipCallId: sid, fromTag, toTag, status, cseq }) => {
         if (!this._call || this._call.callId !== callId) return;
         this._call.sipCallId = sid;
         this._call.fromTag = fromTag;
         this._call.toTag = toTag;
         this._call.status = "answered";
+        // Last INVITE-transaction CSeq (bumped by +1 if a digest auth retry
+        // happened) — hangup() needs this to send BYE with a CSeq that is
+        // strictly greater than the dialog's last request, or the PBX
+        // silently ignores it as a stale/duplicate transaction.
+        this._call.cseq = cseq || 1;
         // Equivalent of JsSIP "accepted" + "confirmed" (ACK already sent by sipClient)
         logger.info(
-          { extension, number, callId, sipCallId: sid, fromTag, toTag, status },
+          { extension, number, callId, sipCallId: sid, fromTag, toTag, status, cseq: this._call.cseq },
           "PromoSoftAdapter: INVITE accepted - answered (confirmed)",
         );
         this._sendEvent("answered", {
@@ -428,31 +447,54 @@ class PromoSoftAdapter extends BaseTelephonyAdapter {
    *
    * - Answered call (inbound or outbound): sends SIP BYE.
    * - Ringing inbound call: sends 486 Busy Here.
-   * - Ringing outbound call: CANCEL not yet implemented.
+   * - Ringing/calling outbound call (not yet answered): sends SIP CANCEL.
    */
   hangup() {
+    logger.info({}, "PromoSoftAdapter: hangup command received");
     try {
       this._requireSession();
     } catch (err) {
       return Promise.reject(err);
     }
-    if (!this._call) return Promise.resolve({});
+    if (!this._call) {
+      logger.warn({}, "PromoSoftAdapter: hangup - no active call found");
+      return Promise.resolve({});
+    }
 
-    const { callId, sipCallId, fromTag, toTag, number, status, direction } = this._call;
+    const { callId, sipCallId, fromTag, toTag, number, status, direction, cseq } = this._call;
     const { extension } = this._session;
 
-    logger.info({ extension, number, status, direction }, "PromoSoftAdapter: hangup");
+    logger.info(
+      { extension, number, status, direction, callId, sipCallId, cseq },
+      "PromoSoftAdapter: hangup - active call found",
+    );
     this._call = null;
+    logger.info({ callId, sipCallId }, "PromoSoftAdapter: local call state cleared");
     this._sendEvent("ended", { callId, sipCallId, number, reason: "local_hangup", endedBy: "local" });
+
+    logger.info(
+      { extension, number, status, direction, sipCallId },
+      "PromoSoftAdapter: hangup - deciding CANCEL vs BYE",
+    );
 
     if (status === "answered" && sipCallId) {
       // For inbound calls we are the UAS — our first in-dialog request, so CSeq: 1.
-      // For outbound calls the INVITE used CSeq 1 (or 2 after auth), so BYE is 2 (default).
-      const byeCseq = direction === "inbound" ? 1 : 2;
+      // For outbound calls, BYE must use a CSeq strictly greater than the one the
+      // INVITE transaction ended up using (it's bumped +1 if a digest auth retry
+      // happened) — otherwise the PBX treats BYE as a stale/duplicate transaction
+      // and silently drops it, leaving the call up despite our local state clearing.
+      const byeCseq = direction === "inbound" ? 1 : (cseq || 1) + 1;
+      logger.info(
+        { extension, number, sipCallId, direction, byeCseq },
+        "PromoSoftAdapter: sending SIP BYE for active dialog",
+      );
       this._sipClient
         .bye({ fromExtension: extension, targetNumber: number, sipCallId, fromTag, toTag, cseq: byeCseq })
+        .then(() =>
+          logger.info({ sipCallId }, "PromoSoftAdapter: BYE transaction completed"),
+        )
         .catch((err) =>
-          logger.warn({ err: err.message }, "PromoSoftAdapter: BYE error (ignored)"),
+          logger.warn({ sipCallId, err: err.message }, "PromoSoftAdapter: BYE error (ignored)"),
         );
     } else if (status === "ringing" && direction === "inbound") {
       // User pressed hangup while an inbound call was ringing — decline it
@@ -461,10 +503,26 @@ class PromoSoftAdapter extends BaseTelephonyAdapter {
         .catch((err) =>
           logger.warn({ err: err.message }, "PromoSoftAdapter: decline (hangup) error (ignored)"),
         );
+    } else if ((status === "calling" || status === "ringing") && direction === "outbound" && sipCallId) {
+      // User pressed hangup before the outbound call was answered — the
+      // INVITE transaction is still pending, so CANCEL it (RFC 3261 §9.1),
+      // not BYE.
+      logger.info(
+        { extension, number, sipCallId, status },
+        "PromoSoftAdapter: hangup before answer (outbound) - sending SIP CANCEL",
+      );
+      this._sipClient
+        .cancel({ sipCallId })
+        .then(() =>
+          logger.info({ sipCallId }, "PromoSoftAdapter: CANCEL transaction completed"),
+        )
+        .catch((err) =>
+          logger.warn({ sipCallId, err: err.message }, "PromoSoftAdapter: CANCEL error (ignored)"),
+        );
     } else {
       logger.info(
-        { extension, number },
-        "PromoSoftAdapter: hangup before answer - CANCEL not yet implemented",
+        { extension, number, status, direction, sipCallId },
+        "PromoSoftAdapter: hangup - no SIP action needed for this call state",
       );
     }
 
