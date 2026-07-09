@@ -58,6 +58,8 @@ class PromoSoftSipClient {
     this._endedCallIds = new Set();
     // Per-call RTP media sessions: sipCallId → { socket, localPort, remoteIp, remotePort, ... }
     this._rtpSessions = new Map();
+    // Callback invoked with each received RTP payload (media bytes, header stripped) for relay to the browser.
+    this._onAudioFrame = null;
     // Rolling cursor into [config.rtpPortMin, config.rtpPortMax] for port allocation.
     this._rtpPortCursor = null;
     // Stable SDP session-id/version for this process lifetime (RFC 4566 §5.2 o= line).
@@ -611,6 +613,31 @@ class PromoSoftSipClient {
               domain: inv.domain,
               onRemoteBye: inv.onRemoteBye,
             });
+            // Parse the 200 OK's SDP answer to learn the remote RTP endpoint and
+            // negotiated codec, then start the outbound audio relay loop.
+            const rtpSession = this._rtpSessions.get(sipCallId);
+            if (rtpSession && parsed.body) {
+              const answeredCodecs = this._parseSdpCodecs(parsed.body);
+              const { remoteIp: sdpRemoteIp, remotePort: sdpRemotePort } = this._parseSdpRemoteRtp(parsed.body);
+              const selected = this._selectCodec(answeredCodecs);
+              if (sdpRemoteIp && sdpRemotePort && (selected.name === "PCMA" || selected.name === "PCMU")) {
+                rtpSession.remoteIp = sdpRemoteIp;
+                rtpSession.remotePort = sdpRemotePort;
+                rtpSession.payloadType = selected.payloadType;
+                logger.info(
+                  { sipCallId, remoteRtp: `${sdpRemoteIp}:${sdpRemotePort}`, selected },
+                  "PromoSoftSipClient: outbound RTP — remote endpoint learned from 200 OK",
+                );
+                this._startRtpMediaLoop(sipCallId);
+              } else {
+                logger.warn(
+                  { sipCallId, sdpRemoteIp, sdpRemotePort, selected },
+                  "PromoSoftSipClient: outbound 200 OK — unusable SDP answer, audio relay skipped",
+                );
+              }
+            } else if (rtpSession) {
+              logger.warn({ sipCallId }, "PromoSoftSipClient: outbound 200 OK had no SDP body — audio relay skipped");
+            }
             inv.resolve({ status, sipCallId, fromTag: inv.fromTag, toTag, cseq: inv.cseq });
           } else if ((status === 401 || status === 407) && !inv.authAttempted) {
             // Authentication challenge — retry INVITE with digest (same flow as REGISTER)
@@ -769,6 +796,7 @@ class PromoSoftSipClient {
               { sipCallId, status, cseq: inv.cseq, branch: inv.branch },
               "PromoSoftSipClient: → ACK sent for non-2xx final response",
             );
+            this._closeRtpSession(sipCallId);
             inv.reject(
               new PromoSoftSipError(
                 `SIP INVITE failed: ${status} ${parsed.reason}`,
@@ -1466,7 +1494,6 @@ class PromoSoftSipClient {
     const sipCallId = this._newCallId();
     const fromTag = this._newTag();
     const branch = this._newBranch();
-    const sdp = this._buildSdp();
 
     // Equivalent of JsSIP "newRTCSession" — log sipCallId so every subsequent
     // event can be correlated back to this call. Includes branch/CSeq/domain
@@ -1482,6 +1509,21 @@ class PromoSoftSipClient {
     try {
       (onInviteCreated || (() => {}))({ sipCallId });
     } catch (_) {}
+
+    // Open the local RTP socket before building the SDP offer so we can
+    // advertise the real bound port (audio relay). Remote endpoint is learned
+    // later from the 200 OK's SDP answer. Falls back to a placeholder port
+    // (silence-only, matches prior behavior) if binding fails.
+    let rtpPort = 20000;
+    try {
+      rtpPort = await this._openRtpSocket({ sipCallId, remoteIp: null, remotePort: null, payloadType: 8 });
+    } catch (err) {
+      logger.warn(
+        { sipCallId, err: err.message },
+        "PromoSoftSipClient: outbound RTP socket open failed — audio relay will be unavailable for this call",
+      );
+    }
+    const sdp = this._buildSdp({ port: rtpPort });
 
     const msg = this._buildInvite({
       fromExtension,
@@ -1507,6 +1549,7 @@ class PromoSoftSipClient {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this._invites.delete(sipCallId);
+        this._closeRtpSession(sipCallId);
         logger.warn(
           { fromExtension, targetNumber, sipCallId },
           `PromoSoftSipClient: INVITE timeout after ${TRANSACTION_TIMEOUT / 1000}s (failed)`,
@@ -1544,6 +1587,7 @@ class PromoSoftSipClient {
         if (err) {
           clearTimeout(timer);
           this._invites.delete(sipCallId);
+          this._closeRtpSession(sipCallId);
           reject(new PromoSoftSipError(`UDP send failed: ${err.message}`, err));
         }
       });
@@ -1774,18 +1818,20 @@ class PromoSoftSipClient {
     ].join("\r\n");
   }
 
-  _buildSdp() {
+  _buildSdp({ port = 20000 } = {}) {
     // Outgoing INVITE offer — list multiple codecs so the remote can choose.
-    const rtpPort = 20000;
+    const advertiseIp = this._config.publicRtpIp || this._localIp;
     return [
       "v=0",
-      `o=- 0 0 IN IP4 ${this._localIp}`,
+      `o=- 0 0 IN IP4 ${advertiseIp}`,
       "s=LabelGateway",
-      `c=IN IP4 ${this._localIp}`,
+      `c=IN IP4 ${advertiseIp}`,
       "t=0 0",
-      `m=audio ${rtpPort} RTP/AVP 8 0`,
+      `m=audio ${port} RTP/AVP 8 0 101`,
       "a=rtpmap:8 PCMA/8000",
       "a=rtpmap:0 PCMU/8000",
+      "a=rtpmap:101 telephone-event/8000",
+      "a=fmtp:101 0-16",
       "a=sendrecv",
       "",
     ].join("\r\n");
@@ -1927,6 +1973,7 @@ class PromoSoftSipClient {
           sendTimer:   null,
           rxCount:     0,
           txCount:     0,
+          outQueue:    [],
         };
 
         const onBindError = (err) => {
@@ -1952,6 +1999,10 @@ class PromoSoftSipClient {
                 { sipCallId, from: `${rinfo.address}:${rinfo.port}`, rxCount: session.rxCount, bytes: msg.length },
                 "PromoSoftSipClient: RTP ← packet",
               );
+            }
+            const payloadType = msg.length > 1 ? (msg[1] & 0x7f) : null;
+            if (this._onAudioFrame && payloadType === session.payloadType && msg.length > 12) {
+              this._onAudioFrame(msg.subarray(12));
             }
           });
 
@@ -1983,26 +2034,28 @@ class PromoSoftSipClient {
   }
 
   /**
-   * Start sending PCMA/PCMU comfort-noise silence frames (20 ms intervals)
-   * to the remote RTP endpoint.  Called after ACK confirms the dialog so
-   * Asterisk does not time out waiting for media.
+   * Start the 20 ms RTP send loop to the remote endpoint. Sends whatever the
+   * browser has queued via sendAudioFrame(); when the queue is empty (mic
+   * not yet started, or gaps between frames) it falls back to a silence
+   * frame in the negotiated codec so Asterisk never times out waiting for
+   * media. Called after ACK confirms the dialog (inbound) or once the 200 OK
+   * SDP answer has been parsed (outbound).
    */
-  _startRtpSilence(sipCallId) {
+  _startRtpMediaLoop(sipCallId) {
     const session = this._rtpSessions.get(sipCallId);
     if (!session || session.sendTimer) return;
 
-    const FRAME_SAMPLES = 160;    // 20 ms at 8 kHz
-    const PT            = 8;      // PCMA — forced for diagnostic clarity
-    const SILENCE_PCMA  = 0xD5;   // G.711 A-law silence value
+    const FRAME_SAMPLES = 160; // 20 ms at 8 kHz
+    const SILENCE       = session.payloadType === 0 ? 0xff : 0xd5; // PCMU vs PCMA silence byte
 
     logger.info(
       {
         sipCallId,
         remoteRtp: `${session.remoteIp}:${session.remotePort}`,
         ssrc:      session.ssrc,
-        pt:        PT,
+        pt:        session.payloadType,
       },
-      "PromoSoftSipClient: RTP → starting PCMA silence stream (diagnostic)",
+      "PromoSoftSipClient: RTP → starting media loop",
     );
 
     session.sendTimer = setInterval(() => {
@@ -2013,15 +2066,17 @@ class PromoSoftSipClient {
       session.seqNum = seq;
       const ts = session.timestamp >>> 0;
       session.timestamp = (session.timestamp + FRAME_SAMPLES) >>> 0;
+      const pt = session.payloadType;
 
       const header = Buffer.alloc(12);
-      header.writeUInt8(0x80, 0);                        // V=2, P=0, X=0, CC=0
-      header.writeUInt8(isMark ? (0x80 | PT) : PT, 1);  // M bit on first packet only
+      header.writeUInt8(0x80, 0);                      // V=2, P=0, X=0, CC=0
+      header.writeUInt8(isMark ? (0x80 | pt) : pt, 1);  // M bit on first packet only
       header.writeUInt16BE(seq, 2);
       header.writeUInt32BE(ts, 4);
       header.writeUInt32BE(session.ssrc, 8);
 
-      const pkt = Buffer.concat([header, Buffer.alloc(FRAME_SAMPLES, SILENCE_PCMA)]);
+      const frame = session.outQueue.shift() || Buffer.alloc(FRAME_SAMPLES, SILENCE);
+      const pkt = Buffer.concat([header, frame]);
       session.socket.send(pkt, 0, pkt.length, session.remotePort, session.remoteIp, (err) => {
         if (err) logger.warn({ sipCallId, err: err.message }, "PromoSoftSipClient: RTP send error");
       });
@@ -2034,7 +2089,7 @@ class PromoSoftSipClient {
             sipCallId,
             txCount:   session.txCount,
             dest:      `${session.remoteIp}:${session.remotePort}`,
-            pt:        PT,
+            pt,
             seq,
             timestamp: ts,
             ssrc:      session.ssrc,
@@ -2046,7 +2101,7 @@ class PromoSoftSipClient {
       } else if (session.txCount % 50 === 0) {
         logger.debug(
           { sipCallId, txCount: session.txCount, remoteRtp: `${session.remoteIp}:${session.remotePort}` },
-          "PromoSoftSipClient: RTP → silence",
+          "PromoSoftSipClient: RTP → media",
         );
       }
     }, 20);
@@ -2062,6 +2117,26 @@ class PromoSoftSipClient {
     if (session.sendTimer) clearInterval(session.sendTimer);
     try { session.socket.close(); } catch (_) {}
     logger.info({ sipCallId, rxCount: session.rxCount }, "PromoSoftSipClient: RTP session closed");
+  }
+
+  /**
+   * Register the callback invoked with each received RTP payload (media
+   * bytes only, RTP header already stripped) for relay to the browser.
+   */
+  onAudioFrame(fn) {
+    this._onAudioFrame = fn;
+  }
+
+  /**
+   * Queue a browser-supplied media frame (already encoded in the
+   * negotiated codec) to be sent on the next 20 ms RTP tick. Capped so a
+   * slow consumer can't build up latency.
+   */
+  sendAudioFrame({ sipCallId, frame }) {
+    const session = this._rtpSessions.get(sipCallId);
+    if (!session) return;
+    session.outQueue.push(frame);
+    while (session.outQueue.length > 3) session.outQueue.shift();
   }
 
   _sendAck({
@@ -2320,7 +2395,7 @@ class PromoSoftSipClient {
           // RFC 3261 §13.3.1.4 Timer G: retransmit 200 OK until ACK arrives.
           this._start200OkRetransmit({ sipCallId, msg, rinfo });
           // Start RTP immediately — don't wait for ACK so Asterisk receives media right away.
-          this._startRtpSilence(sipCallId);
+          this._startRtpMediaLoop(sipCallId);
           resolve({ sipCallId, localTag, callerTag, callerNumber, targetNumber });
         }
       });

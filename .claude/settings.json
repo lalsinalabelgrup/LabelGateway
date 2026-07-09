@@ -6,6 +6,9 @@
       "Bash(grep -n -i \"hangup\\\\|cancel\\\\b\" -A15 \"../LabelPhone/js/services/telephonyGatewayClient.js\" | head -150)",
       "Read(//c/Users/LluísAlsina/DOCUMENTACION_LABELGRUP/PROYECTO_GENIUS/B2COM/LabelSuite/LabelPhone/js/services/**)",
       "Bash(grep -n \"_send\\\\s*=\\\\|_send\\(\" \"../LabelPhone/js/services/telephonyGatewayClient.js\" | head -20)"
+    ],
+    "additionalDirectories": [
+      "C:\\Users\\LluísAlsina\\DOCUMENTACION_LABELGRUP\\PROYECTO_GENIUS\\B2COM\\LabelSuite\\LabelPhone\\js\\services"
     ]
   }
 }

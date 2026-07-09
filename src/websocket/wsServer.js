@@ -46,7 +46,7 @@ function getRegistrationState() {
 
 /* ─── Adapter factory ────────────────────────────────────────────────────── */
 
-function createAdapter(sendEvent) {
+function createAdapter(sendEvent, sendBinary) {
   switch (config.TELEPHONY_PROVIDER) {
     case 'b2com': {
       const B2ComAdapter = require('../adapters/B2ComAdapter');
@@ -54,7 +54,7 @@ function createAdapter(sendEvent) {
     }
     case 'promosoft': {
       const PromoSoftAdapter = require('../adapters/PromoSoftAdapter');
-      return new PromoSoftAdapter(sendEvent);
+      return new PromoSoftAdapter(sendEvent, sendBinary);
     }
     default:
       return new MockAdapter(sendEvent, '1001');
@@ -165,7 +165,19 @@ function setupWsServer(httpServer) {
       }
     };
 
-    const adapter = createAdapter(sendEvent);
+    /* Binary WS frames carry browser-encoded audio (audio-over-WebSocket
+       relay) — sent as-is, no envelope, distinct from the JSON command/event
+       protocol documented above. */
+    const sendBinary = (buf) => {
+      if (ws.readyState !== ws.OPEN) return;
+      try {
+        ws.send(buf, { binary: true });
+      } catch (err) {
+        logger.error({ sessionId, err }, 'sendBinary failed');
+      }
+    };
+
+    const adapter = createAdapter(sendEvent, sendBinary);
 
     /* MockAdapter: emit 'registered' immediately (no connect handshake needed).
        All real adapters: call connect() so each adapter can handle its own
@@ -180,7 +192,12 @@ function setupWsServer(httpServer) {
     }
 
     /* ── Message handling ─────────────────────────────────────────────── */
-    ws.on('message', async (raw) => {
+    ws.on('message', async (raw, isBinary) => {
+      if (isBinary) {
+        if (typeof adapter.pushAudioFrame === 'function') adapter.pushAudioFrame(raw);
+        return;
+      }
+
       let msg;
       try {
         msg = JSON.parse(raw.toString());

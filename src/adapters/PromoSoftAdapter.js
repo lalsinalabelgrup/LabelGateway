@@ -31,10 +31,11 @@ const {
 const logger = require("../utils/logger");
 
 class PromoSoftAdapter extends BaseTelephonyAdapter {
-  constructor(sendEvent) {
+  constructor(sendEvent, sendBinary) {
     super(sendEvent);
     this._config = new PromoSoftConfig();
     this._normalizer = new PromoSoftEventNormalizer();
+    this._sendBinary = sendBinary || (() => {});
 
     if (this._config.mode === 'wss') {
       this._sipClient = new PromoSoftWssClient(this._config);
@@ -47,6 +48,22 @@ class PromoSoftAdapter extends BaseTelephonyAdapter {
     this._session = null; // { extension, displayName } — password NOT stored here
     this._call = null; // { callId, sipCallId, fromTag, toTag, number, status, direction }
     this._sipClient.setIncomingCallHandler(this._onIncomingCallFromSip.bind(this));
+
+    // Audio relay (UDP/PromoSoftSipClient mode only — the wss/JsSIP path is inactive).
+    if (typeof this._sipClient.onAudioFrame === "function") {
+      this._sipClient.onAudioFrame((frame) => this._sendBinary(frame));
+    }
+  }
+
+  /**
+   * Forward a browser-encoded audio frame (binary WS message) into the
+   * active call's RTP session. No-op if there's no answered call.
+   */
+  pushAudioFrame(frame) {
+    if (!this._call || this._call.status !== "answered" || !this._call.sipCallId) return;
+    if (typeof this._sipClient.sendAudioFrame === "function") {
+      this._sipClient.sendAudioFrame({ sipCallId: this._call.sipCallId, frame });
+    }
   }
 
   /* ── Lifecycle ──────────────────────────────────────────────────────────── */
