@@ -10,7 +10,7 @@
  *   B2COM_BASE_URL   +   B2COM_USERNAME + B2COM_PASSWORD
  */
 
-const logger = require('../../utils/logger');
+const logger = require('../../utils/logger').child({ module: 'Config' });
 const { AdapterNotReadyError } = require('./B2ComErrors');
 
 class B2ComConfig {

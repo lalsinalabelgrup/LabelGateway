@@ -23,8 +23,9 @@ class PromoSoftConfig {
     this.sipStunServer = env.PROMOSOFT_STUN_SERVER  || null;
     this.debug        = env.PROMOSOFT_DEBUG === 'true';
     // Write every raw SIP message (INVITE / 200 OK / ACK / BYE) to logs/sip/.
-    // Set PROMOSOFT_SIP_DUMP=true to enable.  Independent of debug logging.
-    this.sipDump      = env.PROMOSOFT_SIP_DUMP === 'true';
+    // Set LOG_SIP_RAW=true (preferred) or PROMOSOFT_SIP_DUMP=true (legacy) to
+    // enable.  Independent of debug logging.
+    this.sipDump      = env.LOG_SIP_RAW === 'true' || env.PROMOSOFT_SIP_DUMP === 'true';
 
     // Local SIP UDP port to bind to (0 = OS picks an ephemeral port).
     // Set PROMOSOFT_SIP_BIND_PORT=5060 or 5062 for a stable port so the
@@ -48,7 +49,7 @@ class PromoSoftConfig {
     this.contactUri = env.PROMOSOFT_CONTACT_URI || null;
 
     if (!this.isServerConfigured()) {
-      const logger = require('../../utils/logger');
+      const logger = require('../../utils/logger').child({ module: 'Config' });
       const missingVar = this.mode === 'wss' ? 'PROMOSOFT_WS_URL' : 'PROMOSOFT_SIP_SERVER';
       logger.warn(
         `PromoSoftConfig: ${missingVar} is not set — ` +

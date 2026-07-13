@@ -26,7 +26,7 @@ const B2ComHttpClient       = require('./b2com/B2ComHttpClient');
 const B2ComWsClient         = require('./b2com/B2ComWsClient');
 const B2ComEventNormalizer  = require('./b2com/B2ComEventNormalizer');
 const { AdapterNotReadyError } = require('./b2com/B2ComErrors');
-const logger                = require('../utils/logger');
+const logger                = require('../utils/logger').child({ module: 'Adapter' });
 
 class B2ComAdapter extends BaseTelephonyAdapter {
   /**

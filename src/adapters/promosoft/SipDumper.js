@@ -20,6 +20,7 @@
 
 const fs   = require("fs");
 const path = require("path");
+const { redactSipText } = require("../../utils/redact");
 
 class SipDumper {
   /**
@@ -49,7 +50,7 @@ class SipDumper {
       const shortId = (sipCallId || "unknown").replace(/[^a-zA-Z0-9]/g, "").slice(0, 8) || "noid";
       const name    = `${ts}-${shortId}-${label}.txt`;
       const file    = path.join(this._logDir, name);
-      fs.writeFileSync(file, text, "utf8");
+      fs.writeFileSync(file, redactSipText(text), "utf8");
       return file;
     } catch (e) {
       process.stderr.write(`SipDumper: write failed (${label}): ${e.message}\n`);

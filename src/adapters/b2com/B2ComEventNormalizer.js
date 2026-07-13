@@ -15,7 +15,7 @@
  *       the B2Com API reference is available.
  */
 
-const logger = require('../../utils/logger');
+const logger = require('../../utils/logger').child({ module: 'Provider' });
 
 /* ── B2Com raw event → normalized event name ─────────────────────────────── */
 // TODO: replace placeholder keys with real B2Com event type strings.

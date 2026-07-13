@@ -28,7 +28,7 @@ const {
   AdapterNotReadyError,
   PromoSoftLoginError,
 } = require("./promosoft/PromoSoftErrors");
-const logger = require("../utils/logger");
+const logger = require("../utils/logger").child({ module: "Adapter" });
 
 class PromoSoftAdapter extends BaseTelephonyAdapter {
   constructor(sendEvent, sendBinary) {
@@ -60,10 +60,51 @@ class PromoSoftAdapter extends BaseTelephonyAdapter {
    * active call's RTP session. No-op if there's no answered call.
    */
   pushAudioFrame(frame) {
-    if (!this._call || this._call.status !== "answered" || !this._call.sipCallId) return;
+    if (!this._call || this._call.status !== "answered" || !this._call.sipCallId) {
+      logger.warn(
+        { hasCall: !!this._call, status: this._call && this._call.status, sipCallId: this._call && this._call.sipCallId },
+        "[AUDIO WS IN BACKEND] pushAudioFrame — no answered call, frame dropped",
+      );
+      return;
+    }
     if (typeof this._sipClient.sendAudioFrame === "function") {
       this._sipClient.sendAudioFrame({ sipCallId: this._call.sipCallId, frame });
+    } else {
+      logger.warn({ sipCallId: this._call.sipCallId }, "[AUDIO WS IN BACKEND] pushAudioFrame — sipClient has no sendAudioFrame, frame dropped");
     }
+  }
+
+  /**
+   * TEMPORARY diagnostic: override the active call's outgoing RTP payload
+   * with a fixed test signal (silence or a verified tone), bypassing the
+   * browser mic/resampler/encoder/WebSocket entirely. No-op if there's no
+   * answered call or the underlying SIP client doesn't support it (wss mode).
+   */
+  debugAudioTest(mode) {
+    if (!this._call || this._call.status !== "answered" || !this._call.sipCallId) {
+      logger.warn(
+        { hasCall: !!this._call, status: this._call && this._call.status },
+        "[AUDIO TEST] debugAudioTest — no answered call, ignoring",
+      );
+      return Promise.resolve({ ok: false, reason: "no_answered_call" });
+    }
+    if (typeof this._sipClient.startAudioTest !== "function") {
+      logger.warn({}, "[AUDIO TEST] debugAudioTest — sipClient has no startAudioTest, ignoring");
+      return Promise.resolve({ ok: false, reason: "not_supported" });
+    }
+    const started = this._sipClient.startAudioTest({ sipCallId: this._call.sipCallId, mode });
+    return Promise.resolve({ ok: started });
+  }
+
+  /**
+   * Stop debugAudioTest() and revert to normal browser-audio relay.
+   */
+  debugAudioTestStop() {
+    if (!this._call || !this._call.sipCallId || typeof this._sipClient.stopAudioTest !== "function") {
+      return Promise.resolve({ ok: false });
+    }
+    const stopped = this._sipClient.stopAudioTest({ sipCallId: this._call.sipCallId });
+    return Promise.resolve({ ok: stopped });
   }
 
   /* ── Lifecycle ──────────────────────────────────────────────────────────── */

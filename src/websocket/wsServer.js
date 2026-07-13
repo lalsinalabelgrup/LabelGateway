@@ -24,7 +24,7 @@
 const { WebSocketServer } = require('ws');
 const MockAdapter         = require('../adapters/MockAdapter');
 const config              = require('../config/config');
-const logger              = require('../utils/logger');
+const logger              = require('../utils/logger').child({ module: 'WebSocket' });
 
 /* ─── Registration state (server-level, updated by event interception) ──────
    Tracks the most recent registration event so /api/status can report it.
@@ -99,6 +99,12 @@ const COMMANDS = {
 
   /* Dev / simulation */
   simulateIncomingCall: (a, p) => a.simulateIncomingCall(p.contact || null),
+
+  /* TEMPORARY diagnostic — backend-only RTP test-signal injection (silence /
+     verified tone), bypassing the browser mic/resampler/encoder/WebSocket.
+     No-op on adapters that don't implement it (e.g. MockAdapter, wss mode). */
+  debugAudioTest:       (a, p) => (typeof a.debugAudioTest === 'function' ? a.debugAudioTest(p.mode) : Promise.resolve({ ok: false, reason: 'not_supported' })),
+  debugAudioTestStop:   (a, p) => (typeof a.debugAudioTestStop === 'function' ? a.debugAudioTestStop() : Promise.resolve({ ok: false, reason: 'not_supported' })),
 
   /* Authentication — used by providers that receive credentials at runtime
      (e.g. PromoSoft). Extension is safe to log; password must NOT be logged
@@ -192,8 +198,68 @@ function setupWsServer(httpServer) {
     }
 
     /* ── Message handling ─────────────────────────────────────────────── */
+    let audioRxCount = 0; // TEMP diagnostics (Phase 7) — remove once outbound audio is confirmed fixed
+    // TEMP diagnostics — WS arrival burst stats (frames within 5ms of the
+    // previous one are grouped into the same burst) to confirm/measure the
+    // browser's bursty ScriptProcessor delivery at the point it reaches the backend.
+    let audioBytesReceived = 0;
+    let arrivalBursts = 0;
+    let curBurstSize = 0;
+    let maxFramesPerBurst = 0;
+    let lastAudioFrameAtHr = null;
+    // Rolling per-window (reset every 50 frames) gap samples, for aggregated
+    // min/max/avg/stddev cadence reporting rather than per-packet logging.
+    let gapWindow = [];
     ws.on('message', async (raw, isBinary) => {
       if (isBinary) {
+        audioRxCount++;
+        audioBytesReceived += raw.length;
+
+        const nowHr = process.hrtime.bigint();
+        const gapMs = lastAudioFrameAtHr === null ? Infinity : Number(nowHr - lastAudioFrameAtHr) / 1e6;
+        lastAudioFrameAtHr = nowHr;
+        if (gapMs > 5) {
+          arrivalBursts++;
+          curBurstSize = 1;
+        } else {
+          curBurstSize++;
+        }
+        maxFramesPerBurst = Math.max(maxFramesPerBurst, curBurstSize);
+        if (Number.isFinite(gapMs)) gapWindow.push(gapMs);
+
+        if (audioRxCount === 1 || audioRxCount % 50 === 0) {
+          logger.info(
+            { sessionId, bytes: raw.length, count: audioRxCount, hasPushAudioFrame: typeof adapter.pushAudioFrame === 'function' },
+            '[AUDIO WS IN BACKEND] binary frame received',
+          );
+
+          let gapMinMs = 0, gapMaxMs = 0, gapAvgMs = 0, gapStddevMs = 0;
+          if (gapWindow.length > 0) {
+            const sum = gapWindow.reduce((a, b) => a + b, 0);
+            gapAvgMs = sum / gapWindow.length;
+            gapMinMs = Math.min(...gapWindow);
+            gapMaxMs = Math.max(...gapWindow);
+            const variance = gapWindow.reduce((acc, v) => acc + (v - gapAvgMs) * (v - gapAvgMs), 0) / gapWindow.length;
+            gapStddevMs = Math.sqrt(variance);
+          }
+          gapWindow = [];
+
+          logger.info(
+            {
+              sessionId,
+              audioFramesReceived: audioRxCount,
+              audioBytesReceived,
+              arrivalBursts,
+              maxFramesPerBurst,
+              avgFramesPerBurst: arrivalBursts > 0 ? audioRxCount / arrivalBursts : 0,
+              gapMinMs,
+              gapMaxMs,
+              gapAvgMs,
+              gapStddevMs,
+            },
+            '[AUDIO WS RECEIVER STATS]',
+          );
+        }
         if (typeof adapter.pushAudioFrame === 'function') adapter.pushAudioFrame(raw);
         return;
       }
