@@ -12,7 +12,7 @@
 const BaseTelephonyAdapter = require('./BaseTelephonyAdapter');
 const CallStateService      = require('../services/CallStateService');
 const config                = require('../config/config');
-const logger                = require('../utils/logger');
+const logger                = require('../utils/logger').child({ module: 'Adapter' });
 
 /* ─── Mock data ─────────────────────────────────────────────────────────── */
 

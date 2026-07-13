@@ -15,7 +15,7 @@
  *       Add methods as endpoints are confirmed by API documentation.
  */
 
-const logger = require('../../utils/logger');
+const logger = require('../../utils/logger').child({ module: 'Provider' });
 const { B2ComApiError, AdapterNotReadyError } = require('./B2ComErrors');
 
 const DEFAULT_TIMEOUT_MS = 10_000;

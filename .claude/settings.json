@@ -5,7 +5,12 @@
       "Read(//c/Users/LluísAlsina/DOCUMENTACION_LABELGRUP/PROYECTO_GENIUS/B2COM/LabelSuite/LabelPhone/js/**)",
       "Bash(grep -n -i \"hangup\\\\|cancel\\\\b\" -A15 \"../LabelPhone/js/services/telephonyGatewayClient.js\" | head -150)",
       "Read(//c/Users/LluísAlsina/DOCUMENTACION_LABELGRUP/PROYECTO_GENIUS/B2COM/LabelSuite/LabelPhone/js/services/**)",
-      "Bash(grep -n \"_send\\\\s*=\\\\|_send\\(\" \"../LabelPhone/js/services/telephonyGatewayClient.js\" | head -20)"
+      "Bash(grep -n \"_send\\\\s*=\\\\|_send\\(\" \"../LabelPhone/js/services/telephonyGatewayClient.js\" | head -20)",
+      "Bash(grep -n \"g711\\\\|audioManager\" \"c:/Users/LluísAlsina/DOCUMENTACION_LABELGRUP/PROYECTO_GENIUS/B2COM/LabelSuite/LabelPhone/index.html\")",
+      "Read(//c/Users/LluísAlsina/DOCUMENTACION_LABELGRUP/PROYECTO_GENIUS/B2COM/LabelSuite/LabelPhone/**)"
+    ],
+    "additionalDirectories": [
+      "C:\\Users\\LluísAlsina\\DOCUMENTACION_LABELGRUP\\PROYECTO_GENIUS\\B2COM\\LabelSuite\\LabelPhone\\js\\services"
     ]
   }
 }

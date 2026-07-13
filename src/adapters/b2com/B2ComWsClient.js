@@ -15,7 +15,7 @@
  */
 
 const { WebSocket } = require('ws');
-const logger = require('../../utils/logger');
+const logger = require('../../utils/logger').child({ module: 'Provider' });
 const { B2ComWsError } = require('./B2ComErrors');
 
 const RECONNECT_DELAY_MS = 5_000; // TODO: use exponential backoff once WS protocol confirmed

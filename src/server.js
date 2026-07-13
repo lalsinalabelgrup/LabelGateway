@@ -27,7 +27,7 @@ const cors = require("cors");
 const setupWsServer = require("./websocket/wsServer");
 const { getRegistrationState } = setupWsServer;
 const config = require("./config/config");
-const logger = require("./utils/logger");
+const logger = require("./utils/logger").child({ module: "Server" });
 
 const app = express();
 
@@ -61,6 +61,18 @@ const server = http.createServer(app);
 setupWsServer(server);
 
 server.listen(config.PORT, config.HOST, () => {
+  logger.info("LabelGateway starting", {
+    nodeVersion: process.version,
+    environment: config.NODE_ENV,
+    provider: config.TELEPHONY_PROVIDER,
+    host: config.HOST,
+    port: config.PORT,
+    wsPath: "/ws",
+    logLevel: config.LOG_LEVEL,
+    fileLoggingEnabled: config.LOG_TO_FILE,
+    rtpLoggingEnabled: config.LOG_RTP,
+    sipRawLoggingEnabled: config.LOG_SIP_RAW,
+  });
   logger.info(`CWD                     :  ${process.cwd()}`);
   logger.info(`Node                    :  ${process.version}`);
   logger.info(
@@ -82,7 +94,36 @@ server.on("error", (err) => {
   process.exit(1);
 });
 
-process.on("SIGTERM", () => {
-  logger.info("SIGTERM received - shutting down");
-  server.close(() => process.exit(0));
+/* ── Graceful shutdown ──────────────────────────────────────────────────── */
+
+let shuttingDown = false;
+
+function shutdown(reason, exitCode) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logger.info({ reason, exitCode }, "LabelGateway shutting down");
+
+  // Never let log-flushing keep the process alive indefinitely.
+  const forceExitTimer = setTimeout(() => process.exit(exitCode), 5000);
+  if (typeof forceExitTimer.unref === "function") forceExitTimer.unref();
+
+  server.close(() => {
+    logger.close().finally(() => {
+      clearTimeout(forceExitTimer);
+      process.exit(exitCode);
+    });
+  });
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM", 0));
+process.on("SIGINT", () => shutdown("SIGINT", 0));
+
+process.on("uncaughtException", (err) => {
+  logger.error({ err }, "Uncaught exception");
+  shutdown("uncaughtException", 1);
+});
+
+process.on("unhandledRejection", (reason) => {
+  logger.error({ err: reason }, "Unhandled promise rejection");
+  shutdown("unhandledRejection", 1);
 });

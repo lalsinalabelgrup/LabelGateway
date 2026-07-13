@@ -31,7 +31,7 @@
 
 const JsSIP         = require('jssip');
 const NodeWebSocket = require('jssip-node-websocket');
-const logger        = require('../../utils/logger');
+const logger        = require('../../utils/logger').child({ module: 'Provider' });
 const { PromoSoftSipError } = require('./PromoSoftErrors');
 const { installGlobals }    = require('./SipRtcStub');
 

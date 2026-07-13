@@ -26,13 +26,165 @@
 const dgram = require("node:dgram");
 const crypto = require("node:crypto");
 const path   = require("node:path");
-const logger = require("../../utils/logger");
+const appConfig = require("../../config/config");
+const logger = require("../../utils/logger").child({ module: "SIP" });
+const rtpLogger = logger.child({ module: "RTP" });
 const { PromoSoftSipError } = require("./PromoSoftErrors");
 const SipDumper = require("./SipDumper");
+const eventLoopMonitor = require("../../utils/eventLoopMonitor");
 
 const EXPIRES_SEC = 3600; // requested registration lifetime
 const REREGISTER_LEAD_SEC = 60; // refresh this many seconds before expiry
 const TRANSACTION_TIMEOUT = 32_000; // RFC 3261 Timer B (max wait for response)
+
+// --- TEMPORARY diagnostic: backend-only RTP test-signal injection ---
+// Lets startAudioTest()/stopAudioTest() override _startRtpMediaLoop's outgoing
+// payload with a fixed, independently-verified buffer, bypassing the browser
+// microphone, resampler, encoder, and WebSocket entirely. Not wired into any
+// SIP/call-control path -- only reachable via the explicit debug commands.
+const SILENCE_FRAME = Buffer.alloc(160, 0xD5); // PCMA silence (160 bytes = 20ms @ 8kHz)
+
+// Reference A-law encoder used ONLY to build the fixed test tone below.
+// Deliberately structurally different (clz32-based segment search) from the
+// shift-loop search in LabelPhone/js/audio/g711.js, so this cannot silently
+// share the bug under investigation there. Self-verified at module load
+// against the ITU-T reference vectors -- throws immediately if wrong rather
+// than shipping a bad test signal.
+function _alawEncodeIndependent(sample) {
+  let pcm = sample | 0;
+  const mask = pcm >= 0 ? 0xD5 : 0x55;
+  if (pcm < 0) pcm = -pcm - 1;
+  if (pcm > 32635) pcm = 32635;
+
+  let seg = 0;
+  if (pcm >= 256) {
+    seg = 32 - Math.clz32(pcm >> 8); // highest set bit position (1-based) -> segment 1..7
+  }
+  const mantissaShift = seg === 0 ? 4 : seg + 3;
+  const aval = (seg << 4) | ((pcm >> mantissaShift) & 0x0F);
+  return (aval ^ mask) & 0xFF;
+}
+
+(function _verifyIndependentEncoder() {
+  const vectors = [
+    [0, 0xD5], [1, 0xD5], [-1, 0x55], [100, 0xD3], [-100, 0x53],
+    [1000, 0xFA], [-1000, 0x7A], [5000, 0x86], [-5000, 0x06],
+    [10000, 0xB6], [-10000, 0x36], [30000, 0xA8], [-30000, 0x28],
+    [32767, 0xAA], [-32768, 0x2A],
+  ];
+  for (const [input, expected] of vectors) {
+    const actual = _alawEncodeIndependent(input);
+    if (actual !== expected) {
+      throw new Error(
+        `PromoSoftSipClient: independent A-law test-tone encoder failed self-check ` +
+        `(input=${input} expected=0x${expected.toString(16)} actual=0x${actual.toString(16)}) -- refusing to build test tone`,
+      );
+    }
+  }
+})();
+
+// Decoder counterpart of _alawEncodeIndependent, used ONLY for packet-loss
+// concealment (see _buildConcealmentFrame): decoding the last real frame to
+// PCM before attenuating it lets concealment fade in the linear domain
+// instead of scaling A-law bytes directly, which would distort the
+// logarithmic encoding. Self-verified by round-tripping through the already
+// -verified encoder rather than a second hand-typed vector table.
+function _alawDecodeIndependent(alaw) {
+  const a = (alaw & 0xFF) ^ 0x55;
+  const sign = a & 0x80;
+  const seg = (a & 0x70) >> 4;
+  const mantissa = a & 0x0F;
+  const sample = seg === 0 ? (mantissa << 4) + 8 : ((mantissa << 4) + 0x108) << (seg - 1);
+  return sign ? sample : -sample;
+}
+
+(function _verifyIndependentDecoder() {
+  for (const pcm of [0, 1, -1, 100, -100, 1000, -1000, 5000, -5000, 10000, -10000, 30000, -30000, 32767, -32768]) {
+    const decoded = _alawDecodeIndependent(_alawEncodeIndependent(pcm));
+    // A-law quantization error grows with segment size; tolerate up to ~10%
+    // of magnitude (plus a small floor) rather than expecting exact round-trip.
+    const tolerance = Math.max(48, Math.abs(pcm) * 0.1);
+    if (Math.abs(decoded - pcm) > tolerance) {
+      throw new Error(
+        `PromoSoftSipClient: independent A-law decoder failed round-trip self-check ` +
+        `(pcm=${pcm} decoded=${decoded} tolerance=${tolerance}) -- refusing to enable concealment`,
+      );
+    }
+  }
+})();
+
+/**
+ * Decode a 160-byte A-law RTP payload to linear PCM (Int16Array), retained
+ * only so packet-loss concealment has something to attenuate/replay across
+ * consecutive underruns. Never used on the RTP send path for real frames —
+ * those are forwarded byte-for-byte from the browser encoder unchanged.
+ */
+function _alawFrameToPcm(buf) {
+  const out = new Int16Array(buf.length);
+  for (let i = 0; i < buf.length; i++) out[i] = _alawDecodeIndependent(buf[i]);
+  return out;
+}
+
+function _pcmToAlawFrame(pcm) {
+  const out = Buffer.alloc(pcm.length);
+  for (let i = 0; i < pcm.length; i++) out[i] = _alawEncodeIndependent(pcm[i]);
+  return out;
+}
+
+/**
+ * Packet-loss concealment for a single missing 20ms frame: replays the last
+ * real PCM frame received before the underrun, attenuated further on every
+ * consecutive lost frame so a run of losses fades toward silence instead of
+ * looping unattenuated voiced audio indefinitely. Resets to full gain the
+ * next time a real frame is consumed (see the `fromQueue` branch in tick()).
+ * Capped at RTP_AUDIO_CONCEALMENT_MAX_FRAMES consecutive frames, after which
+ * it falls back to true silence until real audio resumes.
+ *
+ * Sets session.concealmentActive to tell the caller whether this frame was
+ * genuine concealment (for windowed/lifetime concealment counters) or the
+ * true-silence fallback beyond the cap (counted as silenceFramesSent instead).
+ */
+function _buildConcealmentFrame(session, silenceByte) {
+  const FRAME_SAMPLES = 160;
+  const maxFrames = appConfig.RTP_AUDIO_CONCEALMENT_MAX_FRAMES;
+  if (!session.lastRealFramePcm || maxFrames <= 0 || session.concealmentFramesUsed >= maxFrames) {
+    session.concealmentActive = false;
+    return Buffer.alloc(FRAME_SAMPLES, silenceByte);
+  }
+
+  session.concealmentActive = true;
+  session.concealmentFramesUsed++;
+  session.concealmentFramesTotal++;
+
+  const gain = Math.max(0, 1 - session.concealmentFramesUsed / maxFrames);
+  const sourcePcm = session.lastRealFramePcm;
+  const outPcm = new Int16Array(FRAME_SAMPLES);
+  for (let i = 0; i < FRAME_SAMPLES; i++) {
+    outPcm[i] = Math.round(sourcePcm[i] * gain);
+  }
+  return _pcmToAlawFrame(outPcm);
+}
+
+// 1s (50 frames) of a 440Hz/8kHz A-law tone at amplitude 0.25, generated once
+// at module load from the verified independent encoder above.
+const TEST_TONE_FRAMES = (() => {
+  const SR = 8000;
+  const FREQ = 440;
+  const AMP = 0.25;
+  const bytes = Buffer.alloc(SR);
+  for (let i = 0; i < SR; i++) {
+    const f = Math.sin((2 * Math.PI * FREQ * i) / SR) * AMP;
+    let pcm = Math.round(f * 32767);
+    if (pcm > 32767) pcm = 32767;
+    if (pcm < -32768) pcm = -32768;
+    bytes[i] = _alawEncodeIndependent(pcm);
+  }
+  const frames = [];
+  for (let i = 0; i < bytes.length; i += 160) {
+    frames.push(bytes.subarray(i, i + 160));
+  }
+  return frames;
+})();
 
 class PromoSoftSipClient {
   constructor(config) {
@@ -58,6 +210,8 @@ class PromoSoftSipClient {
     this._endedCallIds = new Set();
     // Per-call RTP media sessions: sipCallId → { socket, localPort, remoteIp, remotePort, ... }
     this._rtpSessions = new Map();
+    // Callback invoked with each received RTP payload (media bytes, header stripped) for relay to the browser.
+    this._onAudioFrame = null;
     // Rolling cursor into [config.rtpPortMin, config.rtpPortMax] for port allocation.
     this._rtpPortCursor = null;
     // Stable SDP session-id/version for this process lifetime (RFC 4566 §5.2 o= line).
@@ -65,7 +219,7 @@ class PromoSoftSipClient {
     this._sdpSessionId = Math.floor(Date.now() / 1000);
     // Raw SIP message dumper — only active when PROMOSOFT_SIP_DUMP=true.
     this._dumper = config.sipDump
-      ? new SipDumper(path.join(process.cwd(), "logs", "sip"))
+      ? new SipDumper(path.resolve(process.cwd(), appConfig.LOG_DIR, "sip"))
       : null;
   }
 
@@ -611,6 +765,33 @@ class PromoSoftSipClient {
               domain: inv.domain,
               onRemoteBye: inv.onRemoteBye,
             });
+            // Parse the 200 OK's SDP answer to learn the remote RTP endpoint and
+            // negotiated codec, then start the outbound audio relay loop.
+            const rtpSession = this._rtpSessions.get(sipCallId);
+            if (rtpSession && parsed.body) {
+              const answeredCodecs = this._parseSdpCodecs(parsed.body);
+              const { remoteIp: sdpRemoteIp, remotePort: sdpRemotePort } = this._parseSdpRemoteRtp(parsed.body);
+              const selected = this._selectCodec(answeredCodecs);
+              // Browser encoder is A-law-only — accept PCMA only. A PCMU answer
+              // would otherwise get A-law bytes mislabeled as mu-law downstream.
+              if (sdpRemoteIp && sdpRemotePort && selected.name === "PCMA") {
+                rtpSession.remoteIp = sdpRemoteIp;
+                rtpSession.remotePort = sdpRemotePort;
+                rtpSession.payloadType = selected.payloadType;
+                logger.info(
+                  { sipCallId, remoteRtp: `${sdpRemoteIp}:${sdpRemotePort}`, selected },
+                  "PromoSoftSipClient: outbound RTP — remote endpoint learned from 200 OK",
+                );
+                this._startRtpMediaLoop(sipCallId);
+              } else {
+                logger.warn(
+                  { sipCallId, sdpRemoteIp, sdpRemotePort, selected },
+                  "PromoSoftSipClient: outbound 200 OK — unusable SDP answer (non-PCMA codec or missing RTP endpoint), audio relay skipped",
+                );
+              }
+            } else if (rtpSession) {
+              logger.warn({ sipCallId }, "PromoSoftSipClient: outbound 200 OK had no SDP body — audio relay skipped");
+            }
             inv.resolve({ status, sipCallId, fromTag: inv.fromTag, toTag, cseq: inv.cseq });
           } else if ((status === 401 || status === 407) && !inv.authAttempted) {
             // Authentication challenge — retry INVITE with digest (same flow as REGISTER)
@@ -769,6 +950,7 @@ class PromoSoftSipClient {
               { sipCallId, status, cseq: inv.cseq, branch: inv.branch },
               "PromoSoftSipClient: → ACK sent for non-2xx final response",
             );
+            this._closeRtpSession(sipCallId);
             inv.reject(
               new PromoSoftSipError(
                 `SIP INVITE failed: ${status} ${parsed.reason}`,
@@ -1466,7 +1648,6 @@ class PromoSoftSipClient {
     const sipCallId = this._newCallId();
     const fromTag = this._newTag();
     const branch = this._newBranch();
-    const sdp = this._buildSdp();
 
     // Equivalent of JsSIP "newRTCSession" — log sipCallId so every subsequent
     // event can be correlated back to this call. Includes branch/CSeq/domain
@@ -1482,6 +1663,21 @@ class PromoSoftSipClient {
     try {
       (onInviteCreated || (() => {}))({ sipCallId });
     } catch (_) {}
+
+    // Open the local RTP socket before building the SDP offer so we can
+    // advertise the real bound port (audio relay). Remote endpoint is learned
+    // later from the 200 OK's SDP answer. Falls back to a placeholder port
+    // (silence-only, matches prior behavior) if binding fails.
+    let rtpPort = 20000;
+    try {
+      rtpPort = await this._openRtpSocket({ sipCallId, remoteIp: null, remotePort: null, payloadType: 8 });
+    } catch (err) {
+      logger.warn(
+        { sipCallId, err: err.message },
+        "PromoSoftSipClient: outbound RTP socket open failed — audio relay will be unavailable for this call",
+      );
+    }
+    const sdp = this._buildSdp({ port: rtpPort });
 
     const msg = this._buildInvite({
       fromExtension,
@@ -1507,6 +1703,7 @@ class PromoSoftSipClient {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this._invites.delete(sipCallId);
+        this._closeRtpSession(sipCallId);
         logger.warn(
           { fromExtension, targetNumber, sipCallId },
           `PromoSoftSipClient: INVITE timeout after ${TRANSACTION_TIMEOUT / 1000}s (failed)`,
@@ -1544,6 +1741,7 @@ class PromoSoftSipClient {
         if (err) {
           clearTimeout(timer);
           this._invites.delete(sipCallId);
+          this._closeRtpSession(sipCallId);
           reject(new PromoSoftSipError(`UDP send failed: ${err.message}`, err));
         }
       });
@@ -1774,18 +1972,21 @@ class PromoSoftSipClient {
     ].join("\r\n");
   }
 
-  _buildSdp() {
-    // Outgoing INVITE offer — list multiple codecs so the remote can choose.
-    const rtpPort = 20000;
+  _buildSdp({ port = 20000 } = {}) {
+    // Outgoing INVITE offer — PCMA only. The LabelPhone browser encoder is
+    // A-law-only, so offering PCMU here would let the remote answer with a
+    // codec the browser can never actually produce.
+    const advertiseIp = this._config.publicRtpIp || this._localIp;
     return [
       "v=0",
-      `o=- 0 0 IN IP4 ${this._localIp}`,
+      `o=- 0 0 IN IP4 ${advertiseIp}`,
       "s=LabelGateway",
-      `c=IN IP4 ${this._localIp}`,
+      `c=IN IP4 ${advertiseIp}`,
       "t=0 0",
-      `m=audio ${rtpPort} RTP/AVP 8 0`,
+      `m=audio ${port} RTP/AVP 8 101`,
       "a=rtpmap:8 PCMA/8000",
-      "a=rtpmap:0 PCMU/8000",
+      "a=rtpmap:101 telephone-event/8000",
+      "a=fmtp:101 0-16",
       "a=sendrecv",
       "",
     ].join("\r\n");
@@ -1927,6 +2128,47 @@ class PromoSoftSipClient {
           sendTimer:   null,
           rxCount:     0,
           txCount:     0,
+          outQueue:    [], // entries: { frame: Buffer, arrivalHr: bigint }
+          // TEMPORARY diagnostic — RTP pacing instrumentation (see _startRtpMediaLoop)
+          rtpLoopStopped: false,
+          loopStartHr:    null,
+          nextDeadline:   null,
+          lastSentAtHr:   null,
+          pacingWindow:   [],
+          sendAttempts:   0,
+          sendSyncErrors: 0,
+          sendCbOk:       0,
+          sendCbErrors:   0,
+          toneIndexLog:   [],
+          // TEMPORARY diagnostic — RTP audio jitter-buffer instrumentation (see
+          // sendAudioFrame() / tick() / _closeRtpSession())
+          audioFramesReceived:  0,
+          audioFramesQueued:    0,
+          audioFramesConsumed:  0,
+          audioFramesDropped:   0,
+          queueOverflowEvents:  0,
+          queueUnderruns:       0,
+          silenceFramesSent:    0,
+          staleFramesDiscarded: 0,
+          maxQueueDepth:        0,
+          sumQueueDepth:        0,
+          queueDepthSamples:    0,
+          queuePrimed:          false,
+          // TEMPORARY diagnostic — mid-call underrun recovery hysteresis and
+          // G.711 packet-loss concealment state (see tick() / _buildConcealmentFrame).
+          queueRecovering:          false,
+          consecutiveUnderruns:     0,
+          maxConsecutiveUnderruns:  0,
+          lastRealFramePcm:         null, // Int16Array(160), retained pre-encoding for concealment
+          concealmentActive:        false,
+          concealmentFramesUsed:    0, // consecutive, resets when a real frame is consumed
+          concealmentFramesTotal:   0, // lifetime, for the close-session summary
+          // Per-pacing-window (reset every 500 packets) — feeds the extended
+          // [RTP PACING STATS] log without requiring per-packet logging.
+          queueDepthWindow:         [],
+          windowUnderruns:          0,
+          windowConcealmentFrames:  0,
+          windowMaxConsecutiveUnderruns: 0,
         };
 
         const onBindError = (err) => {
@@ -1947,16 +2189,39 @@ class PromoSoftSipClient {
 
           sock.on("message", (msg, rinfo) => {
             session.rxCount++;
-            if (session.rxCount === 1 || session.rxCount % 50 === 0) {
-              logger.info(
-                { sipCallId, from: `${rinfo.address}:${rinfo.port}`, rxCount: session.rxCount, bytes: msg.length },
-                "PromoSoftSipClient: RTP ← packet",
+            const payloadType = msg.length > 1 ? (msg[1] & 0x7f) : null;
+            if (session.rxCount === 1) {
+              rtpLogger.info(
+                {
+                  sipCallId,
+                  payloadType,
+                  bytes: msg.length,
+                  sourceAddress: rinfo.address,
+                  sourcePort: rinfo.port,
+                  rxCount: session.rxCount,
+                },
+                "[RTP IN] packet received",
               );
+            } else if (appConfig.LOG_RTP && session.rxCount % 50 === 0) {
+              rtpLogger.debug(
+                {
+                  sipCallId,
+                  payloadType,
+                  bytes: msg.length,
+                  sourceAddress: rinfo.address,
+                  sourcePort: rinfo.port,
+                  rxCount: session.rxCount,
+                },
+                "[RTP IN] packet received",
+              );
+            }
+            if (this._onAudioFrame && payloadType === session.payloadType && msg.length > 12) {
+              this._onAudioFrame(msg.subarray(12));
             }
           });
 
           sock.on("error", (err) => {
-            logger.warn({ sipCallId, err: err.message }, "PromoSoftSipClient: RTP socket error");
+            rtpLogger.warn({ sipCallId, err: err.message }, "PromoSoftSipClient: RTP socket error");
           });
 
           const { port: boundPort } = sock.address();
@@ -1964,7 +2229,7 @@ class PromoSoftSipClient {
           this._rtpPortCursor = boundPort >= portMax ? portMin : boundPort + 1;
           this._rtpSessions.set(sipCallId, session);
 
-          logger.info(
+          rtpLogger.info(
             {
               sipCallId,
               localRtp:      `${this._localIp}:${boundPort}`,
@@ -1983,73 +2248,312 @@ class PromoSoftSipClient {
   }
 
   /**
-   * Start sending PCMA/PCMU comfort-noise silence frames (20 ms intervals)
-   * to the remote RTP endpoint.  Called after ACK confirms the dialog so
-   * Asterisk does not time out waiting for media.
+   * Start the 20 ms RTP send loop to the remote endpoint. Sends whatever the
+   * browser has queued via sendAudioFrame(); when the queue is empty (mic
+   * not yet started, or gaps between frames) it falls back to a silence
+   * frame in the negotiated codec so Asterisk never times out waiting for
+   * media. Called after ACK confirms the dialog (inbound) or once the 200 OK
+   * SDP answer has been parsed (outbound).
    */
-  _startRtpSilence(sipCallId) {
+  _startRtpMediaLoop(sipCallId) {
     const session = this._rtpSessions.get(sipCallId);
     if (!session || session.sendTimer) return;
 
-    const FRAME_SAMPLES = 160;    // 20 ms at 8 kHz
-    const PT            = 8;      // PCMA — forced for diagnostic clarity
-    const SILENCE_PCMA  = 0xD5;   // G.711 A-law silence value
+    const FRAME_SAMPLES = 160; // 20 ms at 8 kHz
+    const FRAME_NS       = 20_000_000n;
+    const SILENCE        = session.payloadType === 0 ? 0xff : 0xd5; // PCMU vs PCMA silence byte
 
-    logger.info(
+    rtpLogger.info(
       {
         sipCallId,
         remoteRtp: `${session.remoteIp}:${session.remotePort}`,
         ssrc:      session.ssrc,
-        pt:        PT,
+        pt:        session.payloadType,
       },
-      "PromoSoftSipClient: RTP → starting PCMA silence stream (diagnostic)",
+      "PromoSoftSipClient: RTP → starting media loop",
     );
 
-    session.sendTimer = setInterval(() => {
-      if (!session.socket || !session.remotePort || !session.remoteIp) return;
+    // TEMPORARY diagnostic — drift-corrected scheduler. A recursive
+    // setTimeout(20)/setInterval(20) accumulates the time spent doing work
+    // inside each tick (header build, Buffer.concat, socket.send, logging)
+    // as drift, so real-world cadence creeps away from 20ms. Scheduling
+    // against an absolute next-deadline (monotonic clock) cancels that
+    // drift: each tick's delay is computed from how far the deadline
+    // actually is from now, not a fixed 20ms from "whenever the last tick
+    // happened to run".
+    session.loopStartHr = process.hrtime.bigint();
+    session.nextDeadline = session.loopStartHr + FRAME_NS;
 
-      const isMark = session.txCount === 0;
-      const seq    = (session.seqNum + 1) & 0xFFFF;
-      session.seqNum = seq;
-      const ts = session.timestamp >>> 0;
-      session.timestamp = (session.timestamp + FRAME_SAMPLES) >>> 0;
+    const tick = () => {
+      if (session.rtpLoopStopped) return;
+
+      const scheduledAt = session.nextDeadline;
+      const sentAtHr    = process.hrtime.bigint();
+      const latenessMs  = Number(sentAtHr - scheduledAt) / 1e6;
+      const deltaMs      = session.lastSentAtHr === null
+        ? null
+        : Number(sentAtHr - session.lastSentAtHr) / 1e6;
+      session.lastSentAtHr = sentAtHr;
+
+      if (!session.socket || !session.remotePort || !session.remoteIp) {
+        session.nextDeadline += FRAME_NS;
+        scheduleNext();
+        return;
+      }
+
+      const isMark    = session.txCount === 0;
+      const seqCandidate = (session.seqNum + 1) & 0xFFFF;
+      const tsCandidate  = session.timestamp >>> 0;
+      const pt = session.payloadType;
 
       const header = Buffer.alloc(12);
-      header.writeUInt8(0x80, 0);                        // V=2, P=0, X=0, CC=0
-      header.writeUInt8(isMark ? (0x80 | PT) : PT, 1);  // M bit on first packet only
-      header.writeUInt16BE(seq, 2);
-      header.writeUInt32BE(ts, 4);
+      header.writeUInt8(0x80, 0);                          // V=2, P=0, X=0, CC=0
+      header.writeUInt8(isMark ? (0x80 | pt) : pt, 1);      // M bit on first packet only
+      header.writeUInt16BE(seqCandidate, 2);
+      header.writeUInt32BE(tsCandidate, 4);
       header.writeUInt32BE(session.ssrc, 8);
 
-      const pkt = Buffer.concat([header, Buffer.alloc(FRAME_SAMPLES, SILENCE_PCMA)]);
-      session.socket.send(pkt, 0, pkt.length, session.remotePort, session.remoteIp, (err) => {
-        if (err) logger.warn({ sipCallId, err: err.message }, "PromoSoftSipClient: RTP send error");
-      });
+      // TEMPORARY diagnostic — sample queue depth every tick, even during
+      // test mode, since sendAudioFrame() keeps queuing browser audio
+      // underneath test-tone/silence mode (see startAudioTest()).
+      session.maxQueueDepth = Math.max(session.maxQueueDepth, session.outQueue.length);
+      session.sumQueueDepth += session.outQueue.length;
+      session.queueDepthSamples++;
+      session.queueDepthWindow.push(session.outQueue.length);
 
-      session.txCount++;
+      let frame;
+      let fromQueue = false;
+      let toneIndexUsed = null;
+      if (session._testMode === "silence") {
+        frame = SILENCE_FRAME;
+      } else if (session._testMode === "tone") {
+        toneIndexUsed = session._testToneIndex % TEST_TONE_FRAMES.length;
+        frame = TEST_TONE_FRAMES[toneIndexUsed];
+        session._testToneIndex = (session._testToneIndex + 1) >>> 0;
+      } else if (!session.queuePrimed) {
+        // Initial prime: accumulate past RTP_AUDIO_QUEUE_START_FRAMES (default
+        // 200ms) before ever draining, so a normal ~85ms browser burst never
+        // lands on an empty queue right after the loop starts. Bounded by a
+        // startup grace period, independent of the configured target, so a
+        // mic that's slow to start (or never starts) doesn't block RTP media
+        // indefinitely — Asterisk needs packets flowing to keep the dialog up.
+        const PRIME_GRACE_MS = 1000;
+        const primedByDepth = session.outQueue.length >= appConfig.RTP_AUDIO_QUEUE_START_FRAMES;
+        const primedByGrace = Number(sentAtHr - session.loopStartHr) / 1e6 >= PRIME_GRACE_MS;
+        if (primedByDepth || primedByGrace) session.queuePrimed = true;
+        // Pre-call buffering is not a loss — plain silence, no concealment.
+        frame = Buffer.alloc(FRAME_SAMPLES, SILENCE);
+      } else {
+        // Primed: normally drain the queue. After a mid-call underrun, wait
+        // for the queue to refill to RTP_AUDIO_QUEUE_RECOVERY_FRAMES (a
+        // smaller threshold than the initial prime) before resuming draining,
+        // so a single frame trickling back in doesn't immediately drain and
+        // re-underrun on the very next tick.
+        let underrun = false;
+        if (session.queueRecovering && session.outQueue.length < appConfig.RTP_AUDIO_QUEUE_RECOVERY_FRAMES) {
+          underrun = true;
+        } else {
+          session.queueRecovering = false;
 
-      if (session.txCount <= 10) {
-        logger.info(
-          {
-            sipCallId,
-            txCount:   session.txCount,
-            dest:      `${session.remoteIp}:${session.remotePort}`,
-            pt:        PT,
-            seq,
-            timestamp: ts,
-            ssrc:      session.ssrc,
-            mark:      isMark,
-            bytes:     pkt.length,
-          },
-          "PromoSoftSipClient: RTP → packet",
-        );
-      } else if (session.txCount % 50 === 0) {
-        logger.debug(
-          { sipCallId, txCount: session.txCount, remoteRtp: `${session.remoteIp}:${session.remotePort}` },
-          "PromoSoftSipClient: RTP → silence",
-        );
+          // Discard anything that's already too old to be worth sending
+          // before consuming the next usable frame.
+          const maxAgeNs = BigInt(appConfig.RTP_AUDIO_QUEUE_MAX_LATENCY_MS) * 1_000_000n;
+          let queuedFrame = session.outQueue.shift();
+          while (queuedFrame && (sentAtHr - queuedFrame.arrivalHr) > maxAgeNs) {
+            session.staleFramesDiscarded++;
+            queuedFrame = session.outQueue.shift();
+          }
+
+          fromQueue = !!queuedFrame;
+          if (fromQueue) {
+            session.audioFramesConsumed++;
+            frame = queuedFrame.frame;
+            // Retain for concealment and reset the ramp — the next underrun
+            // (if any) fades from full gain again rather than continuing a
+            // stale ramp from a previous, unrelated loss.
+            session.lastRealFramePcm = _alawFrameToPcm(frame);
+            session.consecutiveUnderruns = 0;
+            session.concealmentFramesUsed = 0;
+          } else {
+            underrun = true;
+          }
+        }
+
+        if (underrun) {
+          session.queueUnderruns++;
+          session.windowUnderruns++;
+          session.consecutiveUnderruns++;
+          session.maxConsecutiveUnderruns = Math.max(session.maxConsecutiveUnderruns, session.consecutiveUnderruns);
+          session.windowMaxConsecutiveUnderruns = Math.max(session.windowMaxConsecutiveUnderruns, session.consecutiveUnderruns);
+          session.queueRecovering = true;
+
+          frame = _buildConcealmentFrame(session, SILENCE);
+          if (session.concealmentActive) {
+            session.windowConcealmentFrames++;
+          } else {
+            session.silenceFramesSent++; // concealment unavailable or past its cap — true silence
+          }
+        }
       }
-    }, 20);
+      const pkt = Buffer.concat([header, frame]);
+
+      // Do not advance sequence/timestamp unless the send call itself was
+      // actually invoked without throwing synchronously.
+      session.sendAttempts++;
+      let invoked = true;
+      try {
+        session.socket.send(pkt, 0, pkt.length, session.remotePort, session.remoteIp, (err) => {
+          if (err) {
+            session.sendCbErrors++;
+            rtpLogger.warn({ sipCallId, err: err.message }, "PromoSoftSipClient: RTP send error");
+          } else {
+            session.sendCbOk++;
+          }
+        });
+      } catch (err) {
+        invoked = false;
+        session.sendSyncErrors++;
+        rtpLogger.warn({ sipCallId, err: err.message }, "PromoSoftSipClient: RTP send invocation threw — sequence/timestamp not advanced");
+      }
+
+      if (invoked) {
+        session.seqNum = seqCandidate;
+        session.timestamp = (tsCandidate + FRAME_SAMPLES) >>> 0;
+        session.txCount++;
+
+        if (toneIndexUsed !== null && session.toneIndexLog.length < 60) {
+          session.toneIndexLog.push(toneIndexUsed);
+          if (appConfig.LOG_RTP && session.toneIndexLog.length === 60) {
+            rtpLogger.debug({ sipCallId, toneIndexSequence: session.toneIndexLog }, "[RTP TONE INDEX] first 60 tone frame indices");
+          }
+        }
+
+        const isFirstPacket = session.txCount === 1;
+        const isLatenessAnomaly = Math.abs(latenessMs) > 25;
+        const isSevereLateness = Math.abs(latenessMs) > 100;
+
+        if (isFirstPacket || (appConfig.LOG_RTP && (session.txCount % 50 === 0 || isLatenessAnomaly))) {
+          const pacingMeta = {
+            sipCallId,
+            sequence:            seqCandidate,
+            rtpTimestamp:        tsCandidate,
+            testMode:            session._testMode || null,
+            scheduledAtMs:       Number(scheduledAt - session.loopStartHr) / 1e6,
+            sentAtMs:            Number(sentAtHr - session.loopStartHr) / 1e6,
+            deltaFromPreviousMs: deltaMs,
+            latenessMs,
+            queueDepth:          session.outQueue.length,
+            payloadBytes:        frame.length,
+            packetBytes:         pkt.length,
+            mark:                isMark,
+            fromQueue,
+          };
+          rtpLogger[isFirstPacket ? "info" : "debug"](pacingMeta, "[RTP PACING]");
+        }
+
+        if (isSevereLateness) {
+          rtpLogger.warn(
+            {
+              sipCallId,
+              sequence:     seqCandidate,
+              rtpTimestamp: tsCandidate,
+              latenessMs,
+              deltaFromPreviousMs: deltaMs,
+            },
+            "[RTP PACING] severe timing anomaly",
+          );
+        }
+
+        session.pacingWindow.push(deltaMs === null ? 20 : deltaMs);
+        if (session.pacingWindow.length >= 500) {
+          const samples = session.pacingWindow;
+          session.pacingWindow = [];
+          const sorted = [...samples].sort((a, b) => a - b);
+          const sum = samples.reduce((a, b) => a + b, 0);
+          const avgMs = sum / samples.length;
+          const p95 = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95))];
+          const variance = samples.reduce((acc, v) => acc + (v - avgMs) * (v - avgMs), 0) / samples.length;
+          const stddevMs = Math.sqrt(variance);
+          const offTargetCounts = samples.reduce(
+            (acc, v) => {
+              const dev = Math.abs(v - 20);
+              if (dev > 2) acc.outside2ms++;
+              if (dev > 5) acc.outside5ms++;
+              return acc;
+            },
+            { outside2ms: 0, outside5ms: 0 },
+          );
+
+          const depthSamples = session.queueDepthWindow;
+          session.queueDepthWindow = [];
+          const depthSorted = [...depthSamples].sort((a, b) => a - b);
+          const depthP50 = depthSorted.length ? depthSorted[Math.floor(depthSorted.length * 0.5)] : 0;
+          const depthP95 = depthSorted.length ? depthSorted[Math.min(depthSorted.length - 1, Math.floor(depthSorted.length * 0.95))] : 0;
+          const depthMax = depthSorted.length ? depthSorted[depthSorted.length - 1] : 0;
+
+          const windowUnderruns = session.windowUnderruns;
+          const windowConcealmentFrames = session.windowConcealmentFrames;
+          const windowMaxConsecutiveUnderruns = session.windowMaxConsecutiveUnderruns;
+          session.windowUnderruns = 0;
+          session.windowConcealmentFrames = 0;
+          session.windowMaxConsecutiveUnderruns = 0;
+
+          // Do not attribute pacing deviation to Windows/OS scheduling until
+          // it has been checked against Node's own event-loop delay and GC —
+          // both are sampled continuously via a native histogram, so this
+          // costs nothing extra on the hot RTP send path.
+          const eventLoop = eventLoopMonitor.snapshot();
+
+          rtpLogger.info(
+            {
+              sipCallId,
+              testMode:      session._testMode || null,
+              sampleCount:   samples.length,
+              minMs:         sorted[0],
+              maxMs:         sorted[sorted.length - 1],
+              avgMs,
+              stddevMs,
+              p95Ms:         p95,
+              outside2msPct: (offTargetCounts.outside2ms / samples.length) * 100,
+              outside5msPct: (offTargetCounts.outside5ms / samples.length) * 100,
+              over25msCount: samples.filter((v) => v > 25).length,
+              over40msCount: samples.filter((v) => v > 40).length,
+              sendAttempts:   session.sendAttempts,
+              sendSyncErrors: session.sendSyncErrors,
+              sendCbOk:       session.sendCbOk,
+              sendCbErrors:   session.sendCbErrors,
+              queueDepthP50: depthP50,
+              queueDepthP95: depthP95,
+              queueDepthMax: depthMax,
+              windowUnderruns,
+              windowConcealmentFrames,
+              windowMaxConsecutiveUnderruns,
+              eventLoopDelayMinMs:    eventLoop.elDelayMinMs,
+              eventLoopDelayMeanMs:   eventLoop.elDelayMeanMs,
+              eventLoopDelayMaxMs:    eventLoop.elDelayMaxMs,
+              eventLoopDelayStddevMs: eventLoop.elDelayStddevMs,
+              eventLoopDelayP95Ms:    eventLoop.elDelayP95Ms,
+              gcCount:   eventLoop.gcCount,
+              gcTotalMs: eventLoop.gcTotalMs,
+              gcMaxMs:   eventLoop.gcMaxMs,
+            },
+            "[RTP PACING STATS] (window of 500 packets)",
+          );
+        }
+      }
+
+      session.nextDeadline += FRAME_NS;
+      scheduleNext();
+    };
+
+    const scheduleNext = () => {
+      if (session.rtpLoopStopped) return;
+      const now = process.hrtime.bigint();
+      const delayMs = Math.max(0, Number(session.nextDeadline - now) / 1e6);
+      session.sendTimer = setTimeout(tick, delayMs);
+    };
+
+    scheduleNext();
   }
 
   /**
@@ -2059,9 +2563,151 @@ class PromoSoftSipClient {
     const session = this._rtpSessions.get(sipCallId);
     if (!session) return;
     this._rtpSessions.delete(sipCallId);
-    if (session.sendTimer) clearInterval(session.sendTimer);
+    session.rtpLoopStopped = true;
+    if (session.sendTimer) clearTimeout(session.sendTimer);
     try { session.socket.close(); } catch (_) {}
-    logger.info({ sipCallId, rxCount: session.rxCount }, "PromoSoftSipClient: RTP session closed");
+
+    rtpLogger.info(
+      {
+        sipCallId,
+        audioFramesReceived:  session.audioFramesReceived,
+        audioFramesQueued:    session.audioFramesQueued,
+        audioFramesConsumed:  session.audioFramesConsumed,
+        audioFramesDropped:   session.audioFramesDropped,
+        queueOverflowEvents:  session.queueOverflowEvents,
+        queueUnderruns:       session.queueUnderruns,
+        silenceFramesSent:    session.silenceFramesSent,
+        concealmentFramesSent: session.concealmentFramesTotal,
+        maxConsecutiveUnderruns: session.maxConsecutiveUnderruns,
+        staleFramesDiscarded: session.staleFramesDiscarded,
+        maxQueueDepth:        session.maxQueueDepth,
+        avgQueueDepth:        session.queueDepthSamples > 0 ? session.sumQueueDepth / session.queueDepthSamples : 0,
+        txCount:              session.txCount,
+        rxCount:              session.rxCount,
+      },
+      "[RTP AUDIO QUEUE SUMMARY]",
+    );
+
+    rtpLogger.info(
+      { sipCallId, rxCount: session.rxCount, txCount: session.txCount },
+      "PromoSoftSipClient: RTP session closed",
+    );
+  }
+
+  /**
+   * TEMPORARY diagnostic: force the RTP media loop to send a fixed test
+   * signal (silence or a verified 440Hz tone) instead of session.outQueue,
+   * bypassing the browser mic/resampler/encoder/WebSocket entirely. Does not
+   * touch RTP header/timestamp/sequence construction, SDP, or call state.
+   */
+  startAudioTest({ sipCallId, mode }) {
+    const session = this._rtpSessions.get(sipCallId);
+    if (!session) {
+      logger.warn({ sipCallId, mode }, "[AUDIO TEST] startAudioTest — no RTP session for sipCallId");
+      return false;
+    }
+    if (mode !== "silence" && mode !== "tone") {
+      logger.warn({ sipCallId, mode }, "[AUDIO TEST] startAudioTest — unknown mode, ignoring");
+      return false;
+    }
+    session._testMode = mode;
+    session._testToneIndex = 0;
+    session.toneIndexLog = []; // re-arm the first-60-indices proof log for this activation
+    logger.info({ sipCallId, mode }, "[AUDIO TEST] test mode started — RTP payload now sourced from fixed test buffer");
+    return true;
+  }
+
+  /**
+   * Revert startAudioTest(): RTP payload goes back to session.outQueue
+   * (browser mic audio) / silence fallback.
+   */
+  stopAudioTest({ sipCallId }) {
+    const session = this._rtpSessions.get(sipCallId);
+    if (!session) return false;
+    delete session._testMode;
+    delete session._testToneIndex;
+    // Discard whatever accumulated in outQueue while test mode was diverting
+    // the RTP payload elsewhere — otherwise it plays back as a stale burst
+    // the instant real audio resumes, and skews the priming/underrun counters.
+    session.outQueue = [];
+    session.queuePrimed = false;
+    // Full reset of recovery/concealment state too — test mode never fed
+    // lastRealFramePcm, so stale state here could otherwise cause the first
+    // post-test underrun to reference audio from before the test ran.
+    session.queueRecovering = false;
+    session.consecutiveUnderruns = 0;
+    session.lastRealFramePcm = null;
+    session.concealmentActive = false;
+    session.concealmentFramesUsed = 0;
+    logger.info({ sipCallId }, "[AUDIO TEST] test mode stopped — RTP payload reverts to normal queue");
+    return true;
+  }
+
+  /**
+   * Register the callback invoked with each received RTP payload (media
+   * bytes only, RTP header already stripped) for relay to the browser.
+   */
+  onAudioFrame(fn) {
+    this._onAudioFrame = fn;
+  }
+
+  /**
+   * Queue a browser-supplied media frame (already encoded in the
+   * negotiated codec) to be sent on the next 20 ms RTP tick. Capped so a
+   * slow consumer can't build up latency.
+   */
+  sendAudioFrame({ sipCallId, frame }) {
+    const session = this._rtpSessions.get(sipCallId);
+    if (!session) {
+      logger.warn({ sipCallId }, "[AUDIO WS IN BACKEND] sendAudioFrame — no RTP session for sipCallId, frame dropped");
+      return;
+    }
+    // Browser encoder is A-law-only — drop anything queued against a
+    // non-PCMA session instead of sending mislabeled/garbled RTP.
+    if (session.payloadType !== 8) {
+      if (!session._loggedBadCodec) {
+        session._loggedBadCodec = true;
+        logger.warn(
+          { sipCallId, payloadType: session.payloadType },
+          "[AUDIO WS IN BACKEND] sendAudioFrame — session codec is not PCMA(8), dropping browser audio frame",
+        );
+      }
+      return;
+    }
+    session.audioFramesReceived++;
+    session.outQueue.push({ frame, arrivalHr: process.hrtime.bigint() });
+
+    // Overflow: trim oldest frames while over the count cap OR while the
+    // oldest queued frame is already older than the max tolerated latency.
+    // A normal ~4-frame browser burst never trips this against a 25-frame
+    // cap — this only fires when the consumer has genuinely fallen behind.
+    const maxAgeNs = BigInt(appConfig.RTP_AUDIO_QUEUE_MAX_LATENCY_MS) * 1_000_000n;
+    const now = process.hrtime.bigint();
+    let droppedThisCall = 0;
+    while (
+      session.outQueue.length > appConfig.RTP_AUDIO_QUEUE_MAX_FRAMES ||
+      (session.outQueue.length > 0 && (now - session.outQueue[0].arrivalHr) > maxAgeNs)
+    ) {
+      session.outQueue.shift();
+      droppedThisCall++;
+    }
+    if (droppedThisCall > 0) {
+      session.audioFramesDropped += droppedThisCall;
+      session.queueOverflowEvents++;
+      rtpLogger.warn(
+        { sipCallId, droppedThisCall, queueDepth: session.outQueue.length, totalDropped: session.audioFramesDropped },
+        "[RTP AUDIO QUEUE] overflow — dropped oldest frame(s)",
+      );
+    }
+
+    session.audioFramesQueued++;
+    session.rxFrameCount = (session.rxFrameCount || 0) + 1;
+    if (session.rxFrameCount === 1 || session.rxFrameCount % 50 === 0) {
+      logger.info(
+        { sipCallId, count: session.rxFrameCount, bytes: frame.length, queueDepth: session.outQueue.length },
+        "[AUDIO WS IN BACKEND] browser audio frame queued for RTP send",
+      );
+    }
   }
 
   _sendAck({
@@ -2320,7 +2966,7 @@ class PromoSoftSipClient {
           // RFC 3261 §13.3.1.4 Timer G: retransmit 200 OK until ACK arrives.
           this._start200OkRetransmit({ sipCallId, msg, rinfo });
           // Start RTP immediately — don't wait for ACK so Asterisk receives media right away.
-          this._startRtpSilence(sipCallId);
+          this._startRtpMediaLoop(sipCallId);
           resolve({ sipCallId, localTag, callerTag, callerNumber, targetNumber });
         }
       });
