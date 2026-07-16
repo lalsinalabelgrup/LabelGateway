@@ -30,6 +30,11 @@ const {
 } = require("./promosoft/PromoSoftErrors");
 const logger = require("../utils/logger").child({ module: "Adapter" });
 
+// Minimum gap between repeated "unexpected dropped frame" warnings — audio
+// frames arrive every ~20ms, so an unthrottled warning per frame floods the
+// log within a second of any sustained bad state.
+const FRAME_WARN_INTERVAL_MS = 5000;
+
 class PromoSoftAdapter extends BaseTelephonyAdapter {
   constructor(sendEvent, sendBinary) {
     super(sendEvent);
@@ -50,8 +55,14 @@ class PromoSoftAdapter extends BaseTelephonyAdapter {
     this._sipClient.setIncomingCallHandler(this._onIncomingCallFromSip.bind(this));
 
     // Audio relay (UDP/PromoSoftSipClient mode only — the wss/JsSIP path is inactive).
+    // Suppressed while on hold so PBX-generated MOH audio (meant for the held
+    // party, not us) is never forwarded to the browser.
     if (typeof this._sipClient.onAudioFrame === "function") {
-      this._sipClient.onAudioFrame((frame) => this._sendBinary(frame));
+      this._sipClient.onAudioFrame((frame) => {
+        if (this._call && this._call.status === "answered") {
+          this._sendBinary(frame);
+        }
+      });
     }
   }
 
@@ -60,18 +71,49 @@ class PromoSoftAdapter extends BaseTelephonyAdapter {
    * active call's RTP session. No-op if there's no answered call.
    */
   pushAudioFrame(frame) {
-    if (!this._call || this._call.status !== "answered" || !this._call.sipCallId) {
-      logger.warn(
-        { hasCall: !!this._call, status: this._call && this._call.status, sipCallId: this._call && this._call.sipCallId },
-        "[AUDIO WS IN BACKEND] pushAudioFrame — no answered call, frame dropped",
-      );
+    if (!this._call || !this._call.sipCallId) {
+      this._warnDroppedFrame("no_call", { hasCall: !!this._call });
+      return;
+    }
+    // Held is expected, steady-state frame rejection (~50/s while on hold) —
+    // not a warning condition. Silently counted for the next resume diagnostic.
+    if (this._call.status === "held") {
+      this._heldFrameDropCount = (this._heldFrameDropCount || 0) + 1;
+      return;
+    }
+    if (this._call.status !== "answered") {
+      this._warnDroppedFrame("unexpected_status", { status: this._call.status });
       return;
     }
     if (typeof this._sipClient.sendAudioFrame === "function") {
       this._sipClient.sendAudioFrame({ sipCallId: this._call.sipCallId, frame });
+      // A frame just went through — the call is actively answered and
+      // transmitting, so any prior warning backlog is no longer relevant.
+      this._frameWarnState = null;
     } else {
-      logger.warn({ sipCallId: this._call.sipCallId }, "[AUDIO WS IN BACKEND] pushAudioFrame — sipClient has no sendAudioFrame, frame dropped");
+      this._warnDroppedFrame("no_sip_send_support", { sipCallId: this._call.sipCallId });
     }
+  }
+
+  /**
+   * Rate-limited warning for genuinely unexpected dropped frames (no call,
+   * bad status, missing sipClient support) — at most one log line per
+   * FRAME_WARN_INTERVAL_MS, with the suppressed count folded into the next one.
+   */
+  _warnDroppedFrame(reason, details) {
+    const now = Date.now();
+    if (!this._frameWarnState) this._frameWarnState = { lastAt: 0, suppressed: 0 };
+    const st = this._frameWarnState;
+    if (now - st.lastAt < FRAME_WARN_INTERVAL_MS) {
+      st.suppressed++;
+      return;
+    }
+    logger.warn(
+      { reason, ...details, suppressedSinceLast: st.suppressed },
+      "[AUDIO WS IN BACKEND] pushAudioFrame — frame dropped",
+    );
+    st.lastAt = now;
+    st.suppressed = 0;
   }
 
   /**
@@ -519,11 +561,11 @@ class PromoSoftAdapter extends BaseTelephonyAdapter {
       return Promise.resolve({});
     }
 
-    const { callId, sipCallId, fromTag, toTag, number, status, direction, cseq } = this._call;
+    const { callId, sipCallId, fromTag, toTag, number, status, direction } = this._call;
     const { extension } = this._session;
 
     logger.info(
-      { extension, number, status, direction, callId, sipCallId, cseq },
+      { extension, number, status, direction, callId, sipCallId },
       "PromoSoftAdapter: hangup - active call found",
     );
     this._call = null;
@@ -535,19 +577,17 @@ class PromoSoftAdapter extends BaseTelephonyAdapter {
       "PromoSoftAdapter: hangup - deciding CANCEL vs BYE",
     );
 
-    if (status === "answered" && sipCallId) {
-      // For inbound calls we are the UAS — our first in-dialog request, so CSeq: 1.
-      // For outbound calls, BYE must use a CSeq strictly greater than the one the
-      // INVITE transaction ended up using (it's bumped +1 if a digest auth retry
-      // happened) — otherwise the PBX treats BYE as a stale/duplicate transaction
-      // and silently drops it, leaving the call up despite our local state clearing.
-      const byeCseq = direction === "inbound" ? 1 : (cseq || 1) + 1;
+    if ((status === "answered" || status === "held") && sipCallId) {
+      // CSeq for BYE is now owned by PromoSoftSipClient's per-dialog counter
+      // (seeded from the original INVITE transaction, advanced by any hold/
+      // resume re-INVITEs that happened first) so it's always correct
+      // regardless of whether hold was ever used in this call.
       logger.info(
-        { extension, number, sipCallId, direction, byeCseq },
+        { extension, number, sipCallId, direction, status },
         "PromoSoftAdapter: sending SIP BYE for active dialog",
       );
       this._sipClient
-        .bye({ fromExtension: extension, targetNumber: number, sipCallId, fromTag, toTag, cseq: byeCseq })
+        .bye({ fromExtension: extension, targetNumber: number, sipCallId, fromTag, toTag })
         .then(() =>
           logger.info({ sipCallId }, "PromoSoftAdapter: BYE transaction completed"),
         )
@@ -689,11 +729,77 @@ class PromoSoftAdapter extends BaseTelephonyAdapter {
         logger.warn({ err: err.message, sipCallId }, "PromoSoftAdapter: reject SIP response failed (ignored)");
       });
   }
+  /**
+   * Put the active call on hold: SIP re-INVITE with a=sendonly. The call
+   * stays SIP-established — PromoSoft (the PBX/B2BUA) is expected to play
+   * MOH to the held party itself; no audio is synthesized or relayed here.
+   */
   hold() {
-    return this._stub("hold");
+    try {
+      this._requireSession();
+    } catch (err) {
+      return Promise.reject(err);
+    }
+    if (!this._call || this._call.status !== "answered" || !this._call.sipCallId) {
+      return Promise.reject(
+        new AdapterNotReadyError("PromoSoft: no answered call to hold"),
+      );
+    }
+
+    const { callId, sipCallId, number } = this._call;
+
+    return this._sipClient
+      .hold({ sipCallId })
+      .then(() => {
+        if (!this._call || this._call.callId !== callId) return {};
+        this._call.status = "held";
+        this._heldFrameDropCount = 0;
+        logger.info({ callId, sipCallId, number }, "PromoSoftAdapter: call held");
+        this._sendEvent("held", { callId, sipCallId, number });
+        return { callId };
+      })
+      .catch((err) => {
+        logger.warn({ callId, sipCallId, err: err.message }, "PromoSoftAdapter: hold failed");
+        throw err;
+      });
   }
+
+  /**
+   * Resume a held call: SIP re-INVITE with a=sendrecv, restoring two-way
+   * audio on the same dialog immediately.
+   */
   resume() {
-    return this._stub("resume");
+    try {
+      this._requireSession();
+    } catch (err) {
+      return Promise.reject(err);
+    }
+    if (!this._call || this._call.status !== "held" || !this._call.sipCallId) {
+      return Promise.reject(
+        new AdapterNotReadyError("PromoSoft: no held call to resume"),
+      );
+    }
+
+    const { callId, sipCallId, number } = this._call;
+
+    return this._sipClient
+      .resume({ sipCallId })
+      .then(() => {
+        if (!this._call || this._call.callId !== callId) return {};
+        this._call.status = "answered";
+        logger.debug(
+          { callId, sipCallId, framesDroppedWhileHeld: this._heldFrameDropCount || 0 },
+          "PromoSoftAdapter: held-frame suppression summary",
+        );
+        this._heldFrameDropCount = 0;
+        logger.info({ callId, sipCallId, number }, "PromoSoftAdapter: call resumed");
+        this._sendEvent("resumed", { callId, sipCallId, number });
+        return { callId };
+      })
+      .catch((err) => {
+        logger.warn({ callId, sipCallId, err: err.message }, "PromoSoftAdapter: resume failed");
+        throw err;
+      });
   }
   mute() {
     return this._stub("mute");

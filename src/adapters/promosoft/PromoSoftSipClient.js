@@ -203,6 +203,12 @@ class PromoSoftSipClient {
     this._pending = new Map();
     // INVITE transactions: sipCallId → { fromExtension, targetNumber, fromTag, domain, onProvisional, resolve, reject, timer }
     this._invites = new Map();
+    // In-dialog re-INVITE transactions (hold/resume): sipCallId → { ..., resolve, reject, timer }
+    // Kept separate from _invites because re-INVITE responses share the same
+    // CSeq method ("INVITE") as the original call-setup INVITE but must never
+    // be run through that handler's call-establishment side effects (it would
+    // re-seed _calls and restart the RTP loop).
+    this._reinvites = new Map();
     // Callback registered by the adapter to be notified of incoming INVITEs and cancellations.
     // Inbound calls are tracked in _calls (direction:"inbound") for their full lifetime.
     this._onIncomingCall = null;
@@ -678,6 +684,11 @@ class PromoSoftSipClient {
       const key = `${sipCallId}:${cseqNum}`;
 
       if (cseqMethod === "INVITE") {
+        const reinv = this._reinvites.get(sipCallId);
+        if (reinv) {
+          this._handleReinviteResponse(reinv, parsed, h, sipCallId);
+          return;
+        }
         const inv = this._invites.get(sipCallId);
         if (inv) {
           const status = parsed.status;
@@ -764,6 +775,18 @@ class PromoSoftSipClient {
               toTag,
               domain: inv.domain,
               onRemoteBye: inv.onRemoteBye,
+              direction: "outbound",
+              status: "answered",
+              // Dialog-routing state needed for later in-dialog requests (hold/
+              // resume re-INVITEs, BYE) — RFC 3261 §12.1.2: UAC reverses Record-Route.
+              contactUri,
+              routeHeaders,
+              // localCseq starts at the INVITE's own CSeq (bumped +1 already if a
+              // digest-auth retry happened) so the next request we originate in
+              // this dialog (hold re-INVITE or BYE) uses cseq+1, exactly matching
+              // today's ad-hoc `(cseq || 1) + 1` BYE formula when hold is unused.
+              localCseq: inv.cseq,
+              sdpVersion: 0,
             });
             // Parse the 200 OK's SDP answer to learn the remote RTP endpoint and
             // negotiated codec, then start the outbound audio relay loop.
@@ -1056,6 +1079,47 @@ class PromoSoftSipClient {
     });
   }
 
+  /**
+   * Resolve/reject a re-INVITE transaction (hold/resume) and, on 2xx, send
+   * the mandatory ACK (RFC 3261 §13.2.2.4) using the same contactUri/Route
+   * set already learned from the original dialog establishment.
+   */
+  _handleReinviteResponse(reinv, parsed, h, sipCallId) {
+    const status = parsed.status;
+    if (status >= 100 && status <= 199) return; // provisional — nothing to do
+
+    clearTimeout(reinv.timer);
+    this._reinvites.delete(sipCallId);
+
+    if (status >= 200 && status <= 299) {
+      const toTag = (h["to"] || "").match(/tag=([^\s;]+)/i)?.[1] || reinv.toTag;
+      this._sendAck({
+        fromExtension: reinv.fromExtension,
+        targetNumber: reinv.targetNumber,
+        domain: reinv.domain,
+        sipCallId,
+        fromTag: reinv.fromTag,
+        toTag,
+        cseq: reinv.cseq,
+        contactUri: reinv.contactUri,
+        routeHeaders: reinv.routeHeaders,
+      });
+      logger.info(
+        { sipCallId, direction: reinv.direction, mediaDirection: reinv.mediaDirection, status, cseq: reinv.cseq },
+        "PromoSoftSipClient: ← re-INVITE accepted (2xx) — ACK sent",
+      );
+      reinv.resolve({ status, sipCallId });
+    } else {
+      logger.warn(
+        { sipCallId, direction: reinv.direction, mediaDirection: reinv.mediaDirection, status, reason: parsed.reason },
+        "PromoSoftSipClient: ← re-INVITE failed",
+      );
+      reinv.reject(
+        new PromoSoftSipError(`SIP re-INVITE failed: ${status} ${parsed.reason}`, null, status),
+      );
+    }
+  }
+
   /* ── SIP message construction ────────────────────────────────────────── */
 
   _buildRegister({
@@ -1322,6 +1386,14 @@ class PromoSoftSipClient {
     const callId      = `call-${Date.now()}`;
     const contactLine = `<sip:${targetNumber}@${this._localIp}:${this._localPort}>`;
 
+    // Dialog-routing state needed for later in-dialog requests we originate
+    // (hold/resume re-INVITEs) — RFC 3261 §12.1.1: UAS does NOT reverse
+    // Record-Route (unlike the UAC case for outbound calls).
+    const theirContactUri = (contactFull.match(/<([^>]+)>/) || [])[1] || null;
+    const routeHeaders    = recordRoute
+      ? recordRoute.split(",").map((r) => r.trim())
+      : [];
+
     logger.info(
       {
         callId,
@@ -1362,6 +1434,10 @@ class PromoSoftSipClient {
       minSeHeader,
       requiresTimer,
       recordRoute,
+      contactUri:          theirContactUri,
+      routeHeaders,
+      localCseq:           0,
+      sdpVersion:          0,
       response200:         null, // set by answerIncoming(); used to retransmit on INVITE retransmit
       stopRetx:            null, // set by answerIncoming(); cancels Timer G when ACK/BYE arrives
       answer200SentAt:     null, // set when 200 OK is successfully sent; RTP reference if ACK never arrives
@@ -1752,8 +1828,29 @@ class PromoSoftSipClient {
    * Send SIP BYE to end an established dialog.
    * Only valid after INVITE 200 OK (i.e. call is answered).
    */
-  async bye({ fromExtension, targetNumber, sipCallId, fromTag, toTag, cseq = 2 }) {
+  /**
+   * Return the next CSeq number for a request *we* originate in this dialog
+   * (re-INVITE for hold/resume, or BYE), advancing the running counter that
+   * was seeded from the original INVITE transaction's own CSeq. Generalizes
+   * the old ad-hoc "BYE is always the first local in-dialog request" formula
+   * so hold/resume re-INVITEs and BYE never collide or go stale regardless
+   * of call order.
+   */
+  _nextLocalCseq(sipCallId) {
+    const call = this._calls.get(sipCallId);
+    if (!call) return 1;
+    call.localCseq = (call.localCseq || 0) + 1;
+    return call.localCseq;
+  }
+
+  async bye({ fromExtension, targetNumber, sipCallId, fromTag, toTag, cseq = null }) {
     if (!this._socket) return;
+    // If the caller didn't supply an explicit CSeq (the RFC 3261 §9.1 glare
+    // path still does, reusing the original INVITE's transaction CSeq+1),
+    // compute the next one from the dialog's running counter — this is the
+    // same counter hold()/resume() advance, so BYE is always strictly greater
+    // than any re-INVITE that preceded it in this dialog.
+    const cseqToUse = cseq != null ? cseq : this._nextLocalCseq(sipCallId);
     // Remove from active call tracking before sending BYE to prevent a
     // simultaneous remote BYE from firing onRemoteBye after local hangup.
     this._calls.delete(sipCallId);
@@ -1768,23 +1865,23 @@ class PromoSoftSipClient {
       sipCallId,
       fromTag,
       toTag,
-      cseq,
+      cseq: cseqToUse,
     });
     logger.info(
-      { fromExtension, targetNumber, sipCallId, cseq },
+      { fromExtension, targetNumber, sipCallId, cseq: cseqToUse },
       "PromoSoftSipClient: → BYE built and sending",
     );
-    return this._sendAndWait(msg, host, port, `${sipCallId}:${cseq}`)
+    return this._sendAndWait(msg, host, port, `${sipCallId}:${cseqToUse}`)
       .then((res) => {
         logger.info(
-          { sipCallId, cseq, status: res?.status, reason: res?.reason },
+          { sipCallId, cseq: cseqToUse, status: res?.status, reason: res?.reason },
           "PromoSoftSipClient: ← BYE response received",
         );
         return res;
       })
       .catch((err) => {
         logger.warn(
-          { sipCallId, cseq, err: err.message },
+          { sipCallId, cseq: cseqToUse, err: err.message },
           "PromoSoftSipClient: BYE — no response / transaction failed",
         );
         throw err;
@@ -1990,6 +2087,69 @@ class PromoSoftSipClient {
       "a=sendrecv",
       "",
     ].join("\r\n");
+  }
+
+  /**
+   * Build the SDP body for a hold/resume re-INVITE. Same codec/port as the
+   * original offer/answer — only the media direction attribute changes
+   * (`a=sendonly` on hold, `a=sendrecv` on resume) — plus the `o=` line's
+   * sess-version must increment per RFC 4566/3264 whenever session
+   * parameters are re-offered within the same sess-id.
+   */
+  _buildReinviteSdp({ port, direction, sessionId, version }) {
+    const advertiseIp = this._config.publicRtpIp || this._localIp;
+    return [
+      "v=0",
+      `o=- ${sessionId} ${version} IN IP4 ${advertiseIp}`,
+      "s=LabelGateway",
+      `c=IN IP4 ${advertiseIp}`,
+      "t=0 0",
+      `m=audio ${port} RTP/AVP 8 101`,
+      "a=rtpmap:8 PCMA/8000",
+      "a=rtpmap:101 telephone-event/8000",
+      "a=fmtp:101 0-16",
+      `a=${direction}`,
+      "",
+    ].join("\r\n");
+  }
+
+  /**
+   * Build an in-dialog re-INVITE (hold/resume). Modeled on _buildAck's
+   * Route-header-loop pattern, but with a full SDP body and an explicit
+   * (already-tagged) To header since the dialog is already established.
+   */
+  _buildReinvite({
+    fromExtension,
+    targetNumber,
+    domain,
+    sipCallId,
+    fromTag,
+    toTag,
+    requestUri,
+    routeHeaders = [],
+    cseq,
+    sdp,
+    branch = null,
+  }) {
+    const bodyLen = Buffer.byteLength(sdp, "utf8");
+    const lines = [
+      `INVITE ${requestUri} SIP/2.0`,
+      `Via: SIP/2.0/UDP ${this._localIp}:${this._localPort};branch=${branch || this._newBranch()};rport`,
+      `From: <sip:${fromExtension}@${domain}>;tag=${fromTag}`,
+      `To: <sip:${targetNumber}@${domain}>;tag=${toTag}`,
+      `Call-ID: ${sipCallId}`,
+      `CSeq: ${cseq} INVITE`,
+      `Contact: <sip:${fromExtension}@${this._localIp}:${this._localPort}>`,
+      `Max-Forwards: 70`,
+      `Allow: INVITE, ACK, BYE, CANCEL, OPTIONS`,
+      `Content-Type: application/sdp`,
+      `Content-Length: ${bodyLen}`,
+    ];
+    for (const route of routeHeaders) {
+      lines.push(`Route: ${route}`);
+    }
+    lines.push("", sdp);
+    return lines.join("\r\n");
   }
 
   /**
@@ -3050,15 +3210,131 @@ class PromoSoftSipClient {
       new PromoSoftSipError("SIP DECLINE not yet implemented"),
     );
   }
-  hold(_p) {
-    return Promise.reject(
-      new PromoSoftSipError("SIP HOLD not yet implemented"),
-    );
+  /* ── Hold / Resume (in-dialog re-INVITE) ───────────────────────────────── */
+
+  /**
+   * Put an established call on hold: re-INVITE with `a=sendonly`. PromoSoft
+   * is a B2BUA bridging this leg to the far leg, so declaring sendonly here
+   * tells it we will not be listening — it is expected to play MOH to the
+   * held party itself. No local audio is synthesized or relayed.
+   */
+  async hold({ sipCallId }) {
+    return this._sendReinvite({ sipCallId, mediaDirection: "sendonly" });
   }
-  resume(_p) {
-    return Promise.reject(
-      new PromoSoftSipError("SIP RESUME not yet implemented"),
+
+  /**
+   * Resume a held call: re-INVITE with `a=sendrecv`, restoring normal
+   * two-way audio on the same dialog.
+   */
+  async resume({ sipCallId }) {
+    return this._sendReinvite({ sipCallId, mediaDirection: "sendrecv" });
+  }
+
+  /**
+   * Shared re-INVITE sender for hold()/resume(). Reuses the RTP port and
+   * codec already negotiated for this call — only the SDP direction
+   * attribute and the o= sess-version change. The response is routed back
+   * via `_reinvites` (see `_handleReinviteResponse`), not `_pending`, because
+   * its CSeq method is "INVITE" and the generic response dispatcher special-
+   * cases that method (see `_onMessage`).
+   */
+  async _sendReinvite({ sipCallId, mediaDirection }) {
+    if (!this._socket) throw new PromoSoftSipError("SIP socket not open");
+
+    const call = this._calls.get(sipCallId);
+    if (!call) {
+      throw new PromoSoftSipError(`SIP re-INVITE: no active dialog for ${sipCallId}`);
+    }
+    const rtpSession = this._rtpSessions.get(sipCallId);
+    if (!rtpSession) {
+      throw new PromoSoftSipError(`SIP re-INVITE: no RTP session for ${sipCallId}`);
+    }
+
+    const domain = this._config.serverDomain;
+    // Whichever side sends a new in-dialog request puts its OWN local tag in
+    // From and the OTHER party's tag in To — regardless of which side was
+    // originally UAC/UAS for the initial INVITE (RFC 3261 §12.2.1.1).
+    const isInbound = call.direction === "inbound";
+    const localTag = isInbound ? call.localTag : call.fromTag;
+    const remoteTag = isInbound ? call.callerTag : call.toTag;
+    const fromExtension = isInbound ? call.targetNumber : call.fromExtension;
+    const targetNumber = isInbound ? call.callerNumber : call.targetNumber;
+
+    const cseq = this._nextLocalCseq(sipCallId);
+    call.sdpVersion = (call.sdpVersion || 0) + 1;
+    const sdp = this._buildReinviteSdp({
+      port: rtpSession.localPort,
+      direction: mediaDirection,
+      sessionId: this._sdpSessionId,
+      version: call.sdpVersion,
+    });
+
+    const requestUri = call.contactUri || `sip:${targetNumber}@${domain}`;
+    let host = this._config.sipServer;
+    let port = this._config.sipPort;
+    if (call.routeHeaders && call.routeHeaders.length > 0) {
+      const m = call.routeHeaders[0].match(/sip:(?:[^@]+@)?([^;>\s:]+)(?::(\d+))?/i);
+      if (m) { host = m[1]; port = m[2] ? parseInt(m[2], 10) : this._config.sipPort; }
+    } else if (call.contactUri) {
+      const m = call.contactUri.match(/sip:(?:[^@]+@)?([^;>\s:]+)(?::(\d+))?/i);
+      if (m) { host = m[1]; port = m[2] ? parseInt(m[2], 10) : this._config.sipPort; }
+    }
+
+    const msg = this._buildReinvite({
+      fromExtension,
+      targetNumber,
+      domain,
+      sipCallId,
+      fromTag: localTag,
+      toTag: remoteTag,
+      requestUri,
+      routeHeaders: call.routeHeaders || [],
+      cseq,
+      sdp,
+    });
+
+    logger.info(
+      { sipCallId, direction: call.direction, mediaDirection, cseq, requestUri, host, port },
+      "PromoSoftSipClient: → re-INVITE built and sending",
     );
+
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this._reinvites.delete(sipCallId);
+        logger.warn(
+          { sipCallId, mediaDirection },
+          `PromoSoftSipClient: re-INVITE timeout after ${TRANSACTION_TIMEOUT / 1000}s`,
+        );
+        reject(
+          new PromoSoftSipError(`SIP re-INVITE timeout after ${TRANSACTION_TIMEOUT / 1000}s`),
+        );
+      }, TRANSACTION_TIMEOUT);
+
+      this._reinvites.set(sipCallId, {
+        fromExtension,
+        targetNumber,
+        domain,
+        fromTag: localTag,
+        toTag: remoteTag,
+        contactUri: call.contactUri,
+        routeHeaders: call.routeHeaders || [],
+        cseq,
+        direction: call.direction,
+        mediaDirection,
+        timer,
+        resolve,
+        reject,
+      });
+
+      const buf = Buffer.from(msg, "utf8");
+      this._socket.send(buf, 0, buf.length, port, host, (err) => {
+        if (err) {
+          clearTimeout(timer);
+          this._reinvites.delete(sipCallId);
+          reject(new PromoSoftSipError(`UDP send failed: ${err.message}`, err));
+        }
+      });
+    });
   }
   refer(_p) {
     return Promise.reject(
@@ -3098,6 +3374,11 @@ class PromoSoftSipClient {
       inv.reject(new PromoSoftSipError("SIP client destroyed"));
     }
     this._invites.clear();
+    for (const reinv of this._reinvites.values()) {
+      clearTimeout(reinv.timer);
+      reinv.reject(new PromoSoftSipError("SIP client destroyed"));
+    }
+    this._reinvites.clear();
     // Notify the adapter for any calls still active at destroy time
     for (const [sipCallId, call] of this._calls.entries()) {
       if (typeof call.stopRetx === "function") call.stopRetx();
